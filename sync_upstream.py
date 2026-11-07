@@ -46,8 +46,8 @@ class CWDLoss(nn.Module):
         for idx, (s, t) in enumerate(zip(y_s, y_t)):
             assert s.shape == t.shape, f"Shape mismatch at stage {idx}: student {s.shape} vs teacher {t.shape}"
             N, C, H, W = s.shape
-            s_fp32 = s.float().view(-1, W * H) / self.tau
-            t_fp32 = t.float().view(-1, W * H) / self.tau
+            s_fp32 = s.float().reshape(-1, W * H) / self.tau
+            t_fp32 = t.float().reshape(-1, W * H) / self.tau
             softmax_pred_T = F.softmax(t_fp32, dim=1)
             logsoftmax = torch.nn.LogSoftmax(dim=1)
             cost = torch.sum(
@@ -91,7 +91,7 @@ class MGDLoss(nn.Module):
         mat = torch.where(mat > 1 - self.lambda_mgd, 0, 1).to(dtype=preds_S.dtype, device=device)
         masked_fea = torch.mul(preds_S, mat)
         new_fea = self.generation[idx](masked_fea)
-        return loss_mse(new_fea.float(), preds_T.float()) / N
+        return loss_mse(new_fea.float().contiguous(), preds_T.float().contiguous()) / N
 
 
 class FeatureLoss(nn.Module):
@@ -371,10 +371,12 @@ if getattr(self, "distillation_loss", None) is not None:
     kd_params = [p for p in self.distillation_loss.distill_loss_fn.parameters() if p.requires_grad]
     if kd_params:
         base_pg = self.optimizer.param_groups[0]
-        pg = {"params": kd_params, "lr": base_pg.get("lr", self.args.lr0), "weight_decay": 0.0}
-        for k in ("use_muon", "momentum", "betas"):
-            if k in base_pg:
-                pg[k] = False if k == "use_muon" else base_pg[k]
+        pg = {k: v for k, v in base_pg.items() if k not in {"params", "initial_lr"}}
+        pg["params"] = kd_params
+        pg["weight_decay"] = 0.0
+        pg["param_group"] = "kd"
+        if "use_muon" in pg:
+            pg["use_muon"] = False
         self.optimizer.add_param_group(pg)""",
         count=1,
     )
