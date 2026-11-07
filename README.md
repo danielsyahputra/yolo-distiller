@@ -1,4 +1,4 @@
-# Ultralytics YOLO with Additional Knowledge Distillation Capability
+# Ultralytics YOLO with Additional Knowledge Distillation Capability (YOLO26 / YOLO12 / YOLO11 / YOLOv10 / YOLOv9 / YOLOv8)
 
 <div align="center">
   <p>
@@ -12,29 +12,32 @@
 
 ![image](https://github.com/user-attachments/assets/2acfbc67-7cf0-4591-ba27-cdf4370b88e2)
 
+Supports feature-based Knowledge Distillation (`cwd` - Channel-Wise Distillation, and `mgd` - Masked Generative Distillation) across **YOLO26** (`Detect`, `Segment26`, `Pose26`, `OBB26`), **YOLO12**, **YOLO11**, **YOLOv10**, **YOLOv9**, and **YOLOv8**.
 
-## How to Run
+## How to Install & Run
 
-Example:
-
+```bash
+git clone https://github.com/pranta-barua007/yolo-distiller.git
+cd yolo-distiller
+pip install -e .
 ```
-pip install -r requirements.txt
-```
 
-```
+### Example (YOLO26 Instance Segmentation / Detection Knowledge Distillation)
+
+```python
 from ultralytics import YOLO
 
-teacher_model = YOLO("<teacher-path>")
+teacher = YOLO("yolo26l-seg.pt")  # or path to fine-tuned teacher weights (best.pt)
+student = YOLO("yolo26n-seg.pt")  # or path to student weights (best.pt)
 
-student_model = YOLO("yolo11n.pt)
-
-student_model.train(
+student.train(
     data="<data-path>",
-    teacher=teacher_model.model, # None if you don't wanna use knowledge distillation
-    distillation_loss="cwd",
+    teacher=teacher.model,        # or pass `teacher` (YOLO object) or path to `.pt` directly
+    distillation_loss="cwd",      # "cwd" (Channel-Wise Distillation) or "mgd" (Masked Generative Distillation)
+    imgsz=1024,
     epochs=100,
     batch=16,
-    workers=0,
+    workers=2,
     exist_ok=True,
 )
 ```
@@ -44,15 +47,3 @@ student_model.train(
 - Channel-Wise Distillation Loss Implementation: [https://github.com/pppppM/mmdetection-distiller](https://github.com/pppppM/mmdetection-distiller)
 - Mask Generation Distillation Loss Implementation: [https://github.com/yzd-v/MGD](https://github.com/yzd-v/MGD)
 - YOLOv5 Knowledge Distillation Implementation: [https://github.com/wonbeomjang/yolov5-knowledge-distillation](https://github.com/wonbeomjang/yolov5-knowledge-distillation)
-
-```
-@software{Jocher_Ultralytics_YOLO_2023,
-  author = {Jocher, Glenn and Qiu, Jing and Chaurasia, Ayush},
-  license = {AGPL-3.0},
-  month = jan,
-  title = {{Ultralytics YOLO}},
-  url = {https://github.com/ultralytics/ultralytics},
-  version = {8.0.0},
-  year = {2023}
-}
-```

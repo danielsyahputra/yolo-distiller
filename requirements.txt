@@ -1,3 +1,6 @@
+# Ultralytics YOLO (v8.4+ with YOLO26 & Knowledge Distillation) dependencies
+# Note: The ultralytics package version itself (8.4.19+) is defined in ultralytics/__init__.py
+# and installed in editable mode via `-e .` below.
 numpy>=1.23.0
 matplotlib>=3.3.0
 opencv-python>=4.6.0
@@ -8,8 +11,9 @@ scipy>=1.4.1
 torch>=1.8.0
 torchvision>=0.9.0
 tqdm>=4.64.0
-psutil
+psutil>=5.8.0
 py-cpuinfo
 pandas>=1.1.4
 seaborn>=0.11.0
 ultralytics-thop>=2.0.0
+-e .

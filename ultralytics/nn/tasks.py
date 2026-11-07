@@ -19,6 +19,7 @@ from ultralytics.nn.modules import (
     C3TR,
     ELAN1,
     OBB,
+    OBB26,
     PSA,
     SPP,
     SPPELAN,
@@ -51,6 +52,8 @@ from ultralytics.nn.modules import (
     HGStem,
     ImagePoolingAttn,
     Pose,
+    Pose26,
+    Proto26,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -59,6 +62,7 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     Segment,
+    Segment26,
     WorldDetect,
     v10Detect,
 )
@@ -1046,12 +1050,14 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
+        elif m in {Detect, WorldDetect, Segment, Segment26, Pose, Pose26, OBB, OBB26, ImagePoolingAttn, v10Detect}:
             args.append([ch[x] for x in f])
-            if m is Segment:
+            if m in {Segment, Segment26}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, Segment, Pose, OBB}:
+            if m in {Detect, Segment, Segment26, Pose, Pose26, OBB, OBB26}:
                 m.legacy = legacy
+                if d.get("end2end") is not None:
+                    m.end2end = d["end2end"]
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
         elif m is CBLinear:
@@ -1064,6 +1070,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = ch[f]
 
         m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        if isinstance(m_, Detect) and d.get("reg_max") is not None:
+            m_.reg_max = d["reg_max"]
+            m_.no = m_.nc + m_.reg_max * 4
+            m_.dfl = m_.dfl if m_.reg_max > 1 else nn.Identity()
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
@@ -1132,11 +1142,11 @@ def guess_model_task(model):
             return "classify"
         if "detect" in m:
             return "detect"
-        if m == "segment":
+        if "segment" in m:
             return "segment"
-        if m == "pose":
+        if "pose" in m:
             return "pose"
-        if m == "obb":
+        if "obb" in m:
             return "obb"
 
     # Guess from model cfg

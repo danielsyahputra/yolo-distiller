@@ -31,6 +31,7 @@ __all__ = (
     "Bottleneck",
     "BottleneckCSP",
     "Proto",
+    "Proto26",
     "RepC3",
     "ResNetLayer",
     "RepNCSPELAN4",
@@ -92,6 +93,29 @@ class Proto(nn.Module):
     def forward(self, x):
         """Performs a forward pass through layers using an upsampled input image."""
         return self.cv3(self.cv2(self.upsample(self.cv1(x))))
+
+
+class Proto26(Proto):
+    """YOLO26 mask Proto module for segmentation models."""
+
+    def __init__(self, ch, c_=256, c2=32, nc=80):
+        """Initializes the YOLO26 mask Proto module with specified number of protos and masks."""
+        c1 = ch[0] if isinstance(ch, (list, tuple)) else ch
+        super().__init__(c1, c_, c2)
+        if isinstance(ch, (list, tuple)) and len(ch) > 1:
+            self.feat_fuse = nn.ModuleList(Conv(c, c1, 1) for c in ch[1:])
+
+    def forward(self, x):
+        """Performs a forward pass through layers using single or multi-scale feature maps."""
+        if isinstance(x, (list, tuple)):
+            p = x[0]
+            if hasattr(self, "feat_fuse"):
+                for i, feat in enumerate(x[1:]):
+                    p = p + F.interpolate(
+                        self.feat_fuse[i](feat), size=p.shape[2:], mode="bilinear", align_corners=False
+                    )
+            x = p
+        return super().forward(x)
 
 
 class HGStem(nn.Module):

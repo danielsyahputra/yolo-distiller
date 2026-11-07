@@ -1,8 +1,24 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
-__version__ = "8.3.24"
+__version__ = "8.4.19"
 
 import os
+from pathlib import Path as _Path
+
+# Auto-sync latest official Ultralytics (YOLO26 / Segment26 / Proto26) + KD patches on first run when online
+_sync_marker = _Path(__file__).resolve().parent / ".synced_v26"
+_sync_script = _Path(__file__).resolve().parent.parent / "sync_upstream.py"
+if not _sync_marker.exists() and _sync_script.exists():
+    try:
+        import importlib.util as _ilu
+
+        _spec = _ilu.spec_from_file_location("sync_upstream", _sync_script)
+        if _spec and _spec.loader:
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            _mod.sync_ultralytics()
+    except Exception:
+        pass
 
 # Set ENV variables (place before imports)
 if not os.environ.get("OMP_NUM_THREADS"):

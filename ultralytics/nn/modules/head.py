@@ -10,12 +10,23 @@ from torch.nn.init import constant_, xavier_uniform_
 
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 
-from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
+from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto, Proto26
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = (
+    "Detect",
+    "Segment",
+    "Segment26",
+    "Pose",
+    "Pose26",
+    "Classify",
+    "OBB",
+    "OBB26",
+    "RTDETRDecoder",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -178,17 +189,44 @@ class Segment(Detect):
 
         c4 = max(ch[0] // 4, self.nm)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+        if self.end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
 
     def forward(self, x):
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
-        p = self.proto(x[0])  # mask protos
+        p = self.proto(x if isinstance(self.proto, Proto26) else x[0])  # mask protos
         bs = p.shape[0]  # batch size
 
         mc = torch.cat([self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)  # mask coefficients
+        if getattr(self, "end2end", False) and hasattr(self, "one2one_cv4"):
+            x_detach = [xi.detach() for xi in x]
+            one2one_mc = torch.cat(
+                [self.one2one_cv4[i](x_detach[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2
+            )
+            x = Detect.forward(self, x)
+            if self.training:
+                return {"one2many": (x["one2many"], mc, p), "one2one": (x["one2one"], one2one_mc, p)}
+            return (
+                (torch.cat([x, one2one_mc], 1), p)
+                if self.export
+                else (torch.cat([x[0], one2one_mc], 1), (x[1], (mc, one2one_mc), p))
+            )
+
         x = Detect.forward(self, x)
         if self.training:
             return x, mc, p
         return (torch.cat([x, mc], 1), p) if self.export else (torch.cat([x[0], mc], 1), (x[1], mc, p))
+
+
+class Segment26(Segment):
+    """YOLO26 Segment head for segmentation models."""
+
+    end2end = True
+
+    def __init__(self, nc=80, nm=32, npr=256, ch=()):
+        """Initialize the YOLO26 segmentation head with multi-scale Proto26 and end2end support."""
+        super().__init__(nc, nm, npr, ch)
+        self.proto = Proto26(ch, self.npr, self.nm, nc)
 
 
 class OBB(Detect):
@@ -201,6 +239,8 @@ class OBB(Detect):
 
         c4 = max(ch[0] // 4, self.ne)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
+        if self.end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
@@ -221,6 +261,12 @@ class OBB(Detect):
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
 
 
+class OBB26(OBB):
+    """YOLO26 OBB detection head for rotation models."""
+
+    end2end = True
+
+
 class Pose(Detect):
     """YOLO Pose head for keypoints models."""
 
@@ -232,6 +278,8 @@ class Pose(Detect):
 
         c4 = max(ch[0] // 4, self.nk)
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+        if self.end2end:
+            self.one2one_cv4 = copy.deepcopy(self.cv4)
 
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
@@ -259,6 +307,12 @@ class Pose(Detect):
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
+
+
+class Pose26(Pose):
+    """YOLO26 Pose head for keypoints models."""
+
+    end2end = True
 
 
 class Classify(nn.Module):
