@@ -478,12 +478,6 @@ class BaseTrainer:
         self.fitness = None
         self.loss = None
         self.tloss = None
-        if getattr(self, "teacher", None) is not None:
-            if getattr(self, "distillation_loss", None) is None:
-                self.distillation_loss = DistillationLoss(
-                    self.model, self.teacher, distiller=self.loss_type, device=self.device
-                )
-            self.distillation_loss.register_hook()
         self.loss_names = ()
         self.csv = self.save_dir / "results.csv"
         if self.csv.exists() and not self.args.resume:
@@ -671,7 +665,7 @@ class BaseTrainer:
 
         # Compile model (knowledge distillation runs the wrapped model eagerly and relies on
         # find_unused_parameters under DDP for the frozen teacher, so disable compilation when distilling)
-        if self.args.distill_model is not None and self.args.compile:
+        if (self.args.distill_model is not None or getattr(self, "teacher", None) is not None) and self.args.compile:
             LOGGER.warning("'compile' is not supported with knowledge distillation and will be disabled.")
             self.args.compile = False
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
@@ -811,8 +805,16 @@ class BaseTrainer:
                     LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            if getattr(self, "teacher", None) is not None:
+                if getattr(self, "distillation_loss", None) is None:
+                    self.distillation_loss = DistillationLoss(
+                        self.model, self.teacher, distiller=self.loss_type, device=self.device
+                    )
+                self.distillation_loss.register_hook()
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
+                if getattr(self, "distillation_loss", None) is not None:
+                    self.distillation_loss.clear_outputs()
                 # Warmup
                 ni = i + nb * epoch
                 if nw and ni <= nw:  # ni == nw lands accumulate, lr and momentum exactly on their targets
@@ -860,12 +862,12 @@ class BaseTrainer:
                     # Backward
                     if getattr(self, "teacher", None) is not None:
                         distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
-                        with autocast(self.amp):
+                        with autocast(torch.bfloat16 if self.args.amp == "bf16" else self.amp, device=self.device.type):
                             with torch.no_grad():
                                 _ = self.teacher(batch["img"])
                             self.d_loss = self.distillation_loss.get_loss() * distill_weight
                             if RANK != -1:
-                                self.d_loss *= world_size
+                                self.d_loss *= self.world_size
                             self.loss = self.loss + self.d_loss
                     self.scaler.scale(self.loss).backward()
                 except RuntimeError as e:

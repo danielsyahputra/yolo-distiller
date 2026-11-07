@@ -379,10 +379,10 @@ if getattr(self, "distillation_loss", None) is not None:
         count=1,
     )
 
-    # 5. Hook registration at start of each epoch in _do_train
-    content = _inject_after(
+    # 5. Hook registration at start of each epoch in _do_train (right before `for i, batch in pbar:`)
+    content = _inject_before(
         content,
-        r"self\.tloss = None\b.*",
+        r"for i, batch in pbar:",
         """\
 if getattr(self, "teacher", None) is not None:
     if getattr(self, "distillation_loss", None) is None:
@@ -390,6 +390,14 @@ if getattr(self, "teacher", None) is not None:
             self.model, self.teacher, distiller=self.loss_type, device=self.device
         )
     self.distillation_loss.register_hook()""",
+        count=1,
+    )
+    content = _inject_after(
+        content,
+        r'self\.run_callbacks\("on_train_batch_start"\)',
+        """\
+if getattr(self, "distillation_loss", None) is not None:
+    self.distillation_loss.clear_outputs()""",
         count=1,
     )
 
@@ -400,12 +408,12 @@ if getattr(self, "teacher", None) is not None:
         """\
 if getattr(self, "teacher", None) is not None:
     distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
-    with autocast(self.amp):
+    with autocast(torch.bfloat16 if getattr(self.args, "amp", True) == "bf16" else self.amp, device=self.device.type):
         with torch.no_grad():
             _ = self.teacher(batch["img"])
         self.d_loss = self.distillation_loss.get_loss() * distill_weight
         if RANK != -1:
-            self.d_loss *= world_size
+            self.d_loss *= getattr(self, "world_size", 1)
         self.loss = self.loss + self.d_loss""",
         count=1,
     )
