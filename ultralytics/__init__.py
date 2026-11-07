@@ -54,5 +54,3 @@ def __dir__():
 
 if __name__ == "__main__":
     print(__version__)
-
-# UPSTREAM_SYNCED_V26_R3
