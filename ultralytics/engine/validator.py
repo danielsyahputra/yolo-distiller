@@ -1,84 +1,130 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
 Check a model's accuracy on a test or val split of a dataset.
 
 Usage:
-    $ yolo mode=val model=yolov8n.pt data=coco8.yaml imgsz=640
+    $ yolo val model=yolo26n.pt data=coco8.yaml imgsz=640
 
 Usage - formats:
-    $ yolo mode=val model=yolov8n.pt                 # PyTorch
-                          yolov8n.torchscript        # TorchScript
-                          yolov8n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                          yolov8n_openvino_model     # OpenVINO
-                          yolov8n.engine             # TensorRT
-                          yolov8n.mlpackage          # CoreML (macOS-only)
-                          yolov8n_saved_model        # TensorFlow SavedModel
-                          yolov8n.pb                 # TensorFlow GraphDef
-                          yolov8n.tflite             # TensorFlow Lite
-                          yolov8n_edgetpu.tflite     # TensorFlow Edge TPU
-                          yolov8n_paddle_model       # PaddlePaddle
-                          yolov8n_ncnn_model         # NCNN
+    $ yolo val model=yolo26n.pt                 # PyTorch
+                     yolo26n.torchscript        # TorchScript
+                     yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
+                     yolo26n_openvino_model     # OpenVINO
+                     yolo26n.engine             # TensorRT
+                     yolo26n.mlpackage          # CoreML (macOS-only)
+                     yolo26n.aimodel            # Apple Core AI
+                     yolo26n_saved_model        # TensorFlow SavedModel
+                     yolo26n.pb                 # TensorFlow GraphDef
+                     yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
+                     yolo26n.tflite             # LiteRT
+                     yolo26n_paddle_model       # PaddlePaddle
+                     yolo26n.mnn                # MNN
+                     yolo26n_ncnn_model         # NCNN
+                     yolo26n_imx_model          # Sony IMX
+                     yolo26n_rknn_model         # Rockchip RKNN
+                     yolo26n_executorch_model   # ExecuTorch
+                     yolo26n_axelera_model      # Axelera AI
+                     yolo26n_deepx_model        # DEEPX
+                     yolo26n_qnn.onnx           # Qualcomm QNN
+                     yolo26n_hailo_model        # Hailo
+                     yolo26n_ascend_model       # Huawei Ascend
+                     yolo26n_xilinx_model       # AMD Xilinx
 """
+
+from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from ultralytics.cfg import get_cfg, get_save_dir
-from ultralytics.data.utils import check_cls_dataset, check_det_dataset
+from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
 from ultralytics.nn.autobackend import AutoBackend
-from ultralytics.utils import LOGGER, TQDM, callbacks, colorstr, emojis
+from ultralytics.utils import LOCAL_RANK, LOGGER, RANK, TQDM, callbacks, colorstr, emojis
 from ultralytics.utils.checks import check_imgsz
-from ultralytics.utils.ops import Profile
-from ultralytics.utils.torch_utils import de_parallel, select_device, smart_inference_mode
+from ultralytics.utils.ops import Profile, linear_sum_assignment
+from ultralytics.utils.torch_utils import (
+    attempt_compile,
+    autocast,
+    get_torch_device_backend,
+    select_device,
+    smart_inference_mode,
+    torch_distributed_zero_first,
+    unwrap_model,
+)
 
 
 class BaseValidator:
-    """
-    BaseValidator.
+    """A base class for creating validators.
 
-    A base class for creating validators.
+    This class provides the foundation for validation processes, including model evaluation, metric computation, and
+    result visualization.
 
     Attributes:
         args (SimpleNamespace): Configuration for the validator.
-        dataloader (DataLoader): Dataloader to use for validation.
-        pbar (tqdm): Progress bar to update during validation.
+        dataloader (DataLoader): DataLoader to use for validation.
         model (nn.Module): Model to validate.
-        data (dict): Data dictionary.
+        data (dict): Data dictionary containing dataset information.
         device (torch.device): Device to use for validation.
         batch_i (int): Current batch index.
-        training (bool): Whether the model is in training mode.
-        names (dict): Class names.
-        seen: Records the number of images seen so far during validation.
-        stats: Placeholder for statistics during validation.
-        confusion_matrix: Placeholder for a confusion matrix.
-        nc: Number of classes.
-        iouv: (torch.Tensor): IoU thresholds from 0.50 to 0.95 in spaces of 0.05.
-        jdict (dict): Dictionary to store JSON validation results.
-        speed (dict): Dictionary with keys 'preprocess', 'inference', 'loss', 'postprocess' and their respective
-                      batch processing times in milliseconds.
+        training (bool): Whether validation is running during training.
+        names (dict): Class names mapping.
+        seen (int): Number of images seen so far during validation.
+        stats (dict): Statistics collected during validation.
+        confusion_matrix (ConfusionMatrix): Confusion matrix of predictions versus ground truth.
+        nc (int): Number of classes.
+        iouv (torch.Tensor): IoU thresholds from 0.50 to 0.95 in steps of 0.05.
+        jdict (list): List to store JSON validation results.
+        speed (dict): Dictionary with keys 'preprocess', 'inference', 'loss', 'postprocess' and their respective batch
+            processing times in milliseconds.
         save_dir (Path): Directory to save results.
         plots (dict): Dictionary to store plots for visualization.
         callbacks (dict): Dictionary to store various callback functions.
+        stride (int): Model stride for padding calculations.
+        loss (dict): Accumulated loss items during training validation.
+
+    Methods:
+        __call__: Execute validation process, running inference on dataloader and computing performance metrics.
+        match_predictions: Match predictions to ground truth objects using IoU.
+        get_model: Return the training EMA or an independent model for standalone validation.
+        add_callback: Append the given callback to the specified event.
+        run_callbacks: Run all callbacks associated with a specified event.
+        get_dataloader: Get data loader from dataset path and batch size.
+        build_dataset: Build dataset from image path.
+        preprocess: Preprocess an input batch.
+        postprocess: Postprocess the predictions.
+        init_metrics: Initialize performance metrics for the YOLO model.
+        update_metrics: Update metrics based on predictions and batch.
+        finalize_metrics: Finalize and return all metrics.
+        get_stats: Return statistics about the model's performance.
+        gather_stats: Gather statistics from all GPUs during DDP training.
+        print_results: Print the results of the model's predictions.
+        get_desc: Get description of the YOLO model.
+        on_plot: Register plots for visualization.
+        plot_val_samples: Plot validation samples during training.
+        plot_predictions: Plot YOLO model predictions on batch images.
+        pred_to_json: Convert predictions to JSON format.
+        eval_json: Evaluate and return JSON format of prediction statistics.
     """
 
-    def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
-        """
-        Initializes a BaseValidator instance.
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks: dict | None = None):
+        """Initialize a BaseValidator instance.
 
         Args:
-            dataloader (torch.utils.data.DataLoader): Dataloader to be used for validation.
+            dataloader (torch.utils.data.DataLoader, optional): DataLoader to be used for validation.
             save_dir (Path, optional): Directory to save results.
-            pbar (tqdm.tqdm): Progress bar for displaying progress.
-            args (SimpleNamespace): Configuration for the validator.
-            _callbacks (dict): Dictionary to store various callback functions.
+            args (dict | SimpleNamespace, optional): Configuration for the validator.
+            _callbacks (dict, optional): Dictionary to store various callback functions.
         """
+        import torchvision  # noqa (import here so torchvision import time not recorded in postprocess time)
+
         self.args = get_cfg(overrides=args)
         self.dataloader = dataloader
-        self.pbar = pbar
         self.stride = None
         self.data = None
         self.device = None
@@ -96,66 +142,169 @@ class BaseValidator:
         self.save_dir = save_dir or get_save_dir(self.args)
         (self.save_dir / "labels" if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
         if self.args.conf is None:
-            self.args.conf = 0.001  # default conf=0.001
+            self.args.conf = 0.01 if self.args.task == "obb" else 0.001  # reduce OBB val memory usage
         self.args.imgsz = check_imgsz(self.args.imgsz, max_dim=1)
 
         self.plots = {}
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
+    @property
+    def num_images(self) -> int:
+        """Return the number of source images represented by the validation dataset."""
+        dataset = self.dataloader.dataset
+        return len(dataset.tile_counts) if self.args.tile else len(dataset)
+
+    def merge_tiles(self, preds: list | torch.Tensor, batch: dict, pending: dict):
+        """Restore completed sources using existing task scaling, then evaluate their original targets."""
+        from ultralytics.utils import ops
+
+        dataset = self.dataloader.dataset
+        for i, (pred, window, source) in enumerate(zip(preds, batch["tile"], batch["source_index"])):
+            source = int(source)
+            shape = (window[3] - window[1], window[2] - window[0])
+            if isinstance(pred, dict):
+                pred = self.scale_preds(
+                    pred,
+                    {
+                        "imgsz": batch["img"].shape[2:],
+                        "ori_shape": shape,
+                        "ratio_pad": batch["ratio_pad"][i],
+                        "tile": window,
+                    },
+                )
+            elif self.args.task == "classify":
+                pred = {"probs": pred}
+            elif self.args.task == "semantic":
+                pred = {
+                    "semantic_mask": ops.scale_masks(
+                        pred[None, None].float(), shape, mode="nearest", ratio_pad=batch["ratio_pad"][i]
+                    )[0, 0].to(torch.int32)
+                }
+            else:
+                pred = {
+                    "depth": torch.nn.functional.interpolate(
+                        pred.reshape(1, 1, *pred.shape[-2:]).float(), shape, mode="bilinear", align_corners=True
+                    )[0, 0]
+                }
+            predictions, windows = pending.setdefault(source, ([], []))
+            predictions.append(pred)
+            windows.append(window)
+            if len(predictions) != dataset.tile_counts[source]:
+                continue
+            sample = dataset.get_image_and_label(dataset.source_offsets[source], full=True)
+            if self.args.task != "classify":
+                sample = dataset.transforms.transforms[-1](sample)
+            full_batch = self.preprocess_targets(dataset.collate_fn([sample]))
+            output = ops.merge_tiles(
+                predictions,
+                windows,
+                tuple(full_batch["img"].shape[2:]),
+                self.args.iou,
+                self.args.single_cls or self.args.agnostic_nms,
+                self.args.max_det,
+            )
+            if "bboxes" in output:
+                output = [output]
+            elif "depth" in output:
+                output = output["depth"][None, None]
+            else:
+                output = next(iter(output.values()))[None]
+            del pending[source]
+            yield output, full_batch, source
+
     @smart_inference_mode()
-    def __call__(self, trainer=None, model=None):
-        """Executes validation process, running inference on dataloader and computing performance metrics."""
+    def __call__(self, trainer=None, model=None, **kwargs):
+        """Execute validation process, running inference on dataloader and computing performance metrics.
+
+        Args:
+            trainer (object, optional): Trainer object that contains the model to validate.
+            model (nn.Module, optional): Model to validate if not using a trainer.
+            **kwargs (Any): Task-specific model preparation arguments.
+
+        Returns:
+            (dict | None): Dictionary containing validation statistics, or None on non-zero DDP ranks during training.
+        """
         self.training = trainer is not None
+        if not self.training:
+            with torch_distributed_zero_first(LOCAL_RANK):
+                self.args.data = convert_ndjson_to_yolo_if_needed(
+                    self.args.data, self.args.fraction, split=self.args.split
+                )
+        model = self.get_model(model, trainer, **kwargs)
         augment = self.args.augment and (not self.training)
         if self.training:
+            if hasattr(model, "end2end"):
+                model.end2end = self.args.nms is False
             self.device = trainer.device
             self.data = trainer.data
-            # force FP16 val during training
-            self.args.half = self.device.type != "cpu" and trainer.amp
-            model = trainer.ema.ema or trainer.model
-            model = model.half() if self.args.half else model.float()
-            # self.model = model
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            # Keep training validation read-only: inputs may be fp16, but EMA/model weights stay fp32 under autocast.
+            self.args.quantize = 16 if (self.device.type != "cpu" and trainer.amp) else None
+            model = model.float()
+            self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
         else:
-            if str(self.args.model).endswith(".yaml"):
-                LOGGER.warning("WARNING ⚠️ validating an untrained model YAML will result in 0 mAP.")
+            if str(self.args.model).endswith(".yaml") and model is None:
+                LOGGER.warning("validating an untrained model YAML will result in 0 mAP.")
             callbacks.add_integration_callbacks(self)
+            device_type = str(self.args.device).split(":", 1)[0]
+            device_type = device_type if device_type in {"npu", "xpu"} else "cuda"
             model = AutoBackend(
-                weights=model or self.args.model,
-                device=select_device(self.args.device, self.args.batch),
+                model=model or self.args.model,
+                # DDP ranks reuse the device assigned in trainer._setup_ddp()
+                device=select_device(self.args.device)
+                if RANK == -1
+                else torch.device(device_type, get_torch_device_backend(device_type).current_device()),
                 dnn=self.args.dnn,
                 data=self.args.data,
-                fp16=self.args.half,
+                fp16=self.args.quantize == 16,
+                channels_last=self.args.channels_last,
+                end2end=self.args.nms is False,
             )
-            # self.model = model
             self.device = model.device  # update device
-            self.args.half = model.fp16  # update half
-            stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
-            imgsz = check_imgsz(self.args.imgsz, stride=stride)
-            if engine:
-                self.args.batch = model.batch_size
-            elif not pt and not jit:
+            self.args.quantize = 16 if model.fp16 else None  # record actual inference precision
+            stride, fmt = model.stride, model.format
+            pt = fmt == "pt"
+            if augment and not model.base_model:
+                LOGGER.warning(f"'augment' is not supported by this model (format='{fmt}'), ignoring.")
+                augment = False
+            imgsz = check_imgsz(self.args.imgsz, stride=stride, min_dim=2)
+            if fmt != "pt" and hasattr(model, "imgsz") and not getattr(model, "dynamic", False):
+                self.args.imgsz = imgsz = model.imgsz  # reuse the full input shape from export metadata
+            if fmt not in {"pt", "torchscript"} and not getattr(model, "dynamic", False):
                 self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
-                LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
+                LOGGER.info(
+                    f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz[0]}, {imgsz[1]})"
+                )
 
-            if str(self.args.data).split(".")[-1] in {"yaml", "yml"}:
-                self.data = check_det_dataset(self.args.data)
-            elif self.args.task == "classify":
+            if self.args.task == "classify":
                 self.data = check_cls_dataset(self.args.data, split=self.args.split)
+            elif str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"} or self.args.task in {
+                "detect",
+                "segment",
+                "pose",
+                "obb",
+                "semantic",
+                "depth",
+            }:
+                self.data = check_det_dataset(self.args.data, split=self.args.split)
             else:
                 raise FileNotFoundError(emojis(f"Dataset '{self.args.data}' for task={self.args.task} not found ❌"))
 
             if self.device.type in {"cpu", "mps"}:
                 self.args.workers = 0  # faster CPU val as time dominated by inference, not dataloading
-            if not pt:
+            if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
                 self.args.rect = False
             self.stride = model.stride  # used in get_dataloader() for padding
+            self.names = model.names  # used in get_dataloader() to filter classification samples
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()
-            model.warmup(imgsz=(1 if pt else self.args.batch, 3, imgsz, imgsz))  # warmup
+            if self.args.compile:
+                model = attempt_compile(model, device=self.device, mode=self.args.compile)
+            model.warmup(
+                imgsz=(1 if pt else self.dataloader.batch_size or self.args.batch, self.data["channels"], *imgsz)
+            )  # warmup
 
         self.run_callbacks("on_val_start")
         dt = (
@@ -165,8 +314,9 @@ class BaseValidator:
             Profile(device=self.device),
         )
         bar = TQDM(self.dataloader, desc=self.get_desc(), total=len(self.dataloader))
-        self.init_metrics(de_parallel(model))
+        self.init_metrics(unwrap_model(model))
         self.jdict = []  # empty before each val
+        tile_results = {}
         for batch_i, batch in enumerate(bar):
             self.run_callbacks("on_val_batch_start")
             self.batch_i = batch_i
@@ -174,43 +324,62 @@ class BaseValidator:
             with dt[0]:
                 batch = self.preprocess(batch)
 
-            # Inference
-            with dt[1]:
-                preds = model(batch["img"], augment=augment)
+            with autocast(self.training and self.args.quantize == 16, device=self.device.type):
+                # Inference
+                with dt[1]:
+                    preds = model(batch["img"], augment=augment)
 
-            # Loss
-            with dt[2]:
-                if self.training:
-                    self.loss += model.loss(batch, preds)[1]
+                # Loss
+                with dt[2]:
+                    if self.training:
+                        for k, v in model.loss(batch, preds)[1].items():
+                            self.loss[k] += v
 
             # Postprocess
             with dt[3]:
                 preds = self.postprocess(preds)
-
-            self.update_metrics(preds, batch)
-            if self.args.plots and batch_i < 3:
-                self.plot_val_samples(batch, batch_i)
-                self.plot_predictions(batch, preds, batch_i)
+                outputs = (
+                    list(self.merge_tiles(preds, batch, tile_results)) if self.args.tile else [(preds, batch, batch_i)]
+                )
+            for output, targets, image_i in outputs:
+                self.update_metrics(output, targets)
+                if self.args.plots and image_i < 3 and RANK in {-1, 0}:
+                    self.plot_val_samples(targets, image_i)
+                    self.plot_predictions(targets, output, image_i)
 
             self.run_callbacks("on_val_batch_end")
-        stats = self.get_stats()
-        self.check_stats(stats)
-        self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1e3 for x in dt)))
-        self.finalize_metrics()
-        self.print_results()
-        self.run_callbacks("on_val_end")
+
+        stats = {}
+        self.gather_stats()
+        if RANK in {-1, 0}:
+            stats = self.get_stats()
+            self.speed = dict(zip(self.speed.keys(), (x.t / self.num_images * 1e3 for x in dt)))
+            self.finalize_metrics()
+            self.print_results()
+            self.run_callbacks("on_val_end")
+
         if self.training:
-            model.float()
-            results = {**stats, **trainer.label_loss_items(self.loss.cpu() / len(self.dataloader), prefix="val")}
+            # Reduce sums and their batch count together: source-aligned shards can contain unequal tile counts.
+            loss = torch.stack(
+                [*(v.reshape(()) for v in self.loss.values()), torch.tensor(len(self.dataloader), device=self.device)]
+            )
+            if trainer.world_size > 1:
+                dist.reduce(loss, dst=0, op=dist.ReduceOp.SUM)
+            if RANK > 0:
+                return
+            loss = dict(zip(self.loss, (loss[:-1] / loss[-1]).cpu()))
+            results = {**stats, **trainer.label_loss_items(loss, prefix="val")}
             return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
         else:
+            if RANK > 0:
+                return stats
             LOGGER.info(
                 "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
                     *tuple(self.speed.values())
                 )
             )
             if self.args.save_json and self.jdict:
-                with open(str(self.save_dir / "predictions.json"), "w") as f:
+                with open(str(self.save_dir / "predictions.json"), "w", encoding="utf-8") as f:
                     LOGGER.info(f"Saving {f.name}...")
                     json.dump(self.jdict, f)  # flatten and save
                 stats = self.eval_json(stats)  # update stats
@@ -218,18 +387,20 @@ class BaseValidator:
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
             return stats
 
-    def match_predictions(self, pred_classes, true_classes, iou, use_scipy=False):
-        """
-        Matches predictions to ground truth objects (pred_classes, true_classes) using IoU.
+    def match_predictions(
+        self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
+    ) -> torch.Tensor:
+        """Match predictions to ground truth objects using IoU.
 
         Args:
-            pred_classes (torch.Tensor): Predicted class indices of shape(N,).
-            true_classes (torch.Tensor): Target class indices of shape(M,).
-            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground of truth
-            use_scipy (bool): Whether to use scipy for matching (more precise).
+            pred_classes (torch.Tensor): Predicted class indices of shape (N,), ordered by descending confidence.
+            true_classes (torch.Tensor): Target class indices of shape (M,).
+            iou (torch.Tensor): An MxN tensor containing the pairwise IoU values for ground truth (rows) and predictions
+                (columns).
+            use_scipy (bool, optional): Whether to use Hungarian one-to-one matching (more precise).
 
         Returns:
-            (torch.Tensor): Correct tensor of shape(N,10) for 10 IoU thresholds.
+            (torch.Tensor): Boolean correct tensor of shape (N, T) for T IoU thresholds (10 by default).
         """
         # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
@@ -237,35 +408,43 @@ class BaseValidator:
         correct_class = true_classes[:, None] == pred_classes
         iou = iou * correct_class  # zero out the wrong classes
         iou = iou.cpu().numpy()
-        for i, threshold in enumerate(self.iouv.cpu().tolist()):
-            if use_scipy:
-                # WARNING: known issue that reduces mAP in https://github.com/ultralytics/ultralytics/pull/4708
-                import scipy  # scope import to avoid importing for all commands
-
+        thresholds = self.iouv.cpu().numpy()
+        if use_scipy:
+            for i, threshold in enumerate(thresholds):
                 cost_matrix = iou * (iou >= threshold)
                 if cost_matrix.any():
-                    labels_idx, detections_idx = scipy.optimize.linear_sum_assignment(cost_matrix, maximize=True)
+                    labels_idx, detections_idx = linear_sum_assignment(-cost_matrix)  # negate to maximize IoU
                     valid = cost_matrix[labels_idx, detections_idx] > 0
                     if valid.any():
                         correct[detections_idx[valid], i] = True
-            else:
-                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
-                matches = np.array(matches).T
-                if matches.shape[0]:
-                    if matches.shape[0] > 1:
-                        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                        # matches = matches[matches[:, 2].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-                    correct[matches[:, 1].astype(int), i] = True
-        return torch.tensor(correct, dtype=torch.bool, device=pred_classes.device)
+        else:
+            matched = np.zeros((iou.shape[0], len(thresholds)), dtype=bool)  # targets claimed at each threshold
+            for j in np.flatnonzero((iou >= thresholds.min()).any(0)):  # detections in descending confidence order
+                available = np.where(matched, 0, iou[:, j, None])  # IoU with each unclaimed target per threshold
+                k = available.argmax(0)  # best unclaimed target per threshold
+                correct[j] = available[k, range(len(thresholds))] >= thresholds
+                matched[k, range(len(thresholds))] |= correct[j]
+        return torch.from_numpy(correct)
+
+    @smart_inference_mode(False)
+    def get_model(self, model, trainer=None):
+        """Return the training EMA or an independent model for standalone validation.
+
+        Args:
+            model (torch.nn.Module | str | Path | None): Model or checkpoint for standalone validation.
+            trainer (object, optional): Trainer whose EMA is used during training validation.
+
+        Returns:
+            (torch.nn.Module | str | Path | None): Model to prepare for inference.
+        """
+        return trainer.ema.ema if trainer is not None else deepcopy(model)
 
     def add_callback(self, event: str, callback):
-        """Appends the given callback."""
+        """Append the given callback to the specified event."""
         self.callbacks[event].append(callback)
 
     def run_callbacks(self, event: str):
-        """Runs all callbacks associated with a specified event."""
+        """Run all callbacks associated with a specified event."""
         for callback in self.callbacks.get(event, []):
             callback(self)
 
@@ -274,67 +453,63 @@ class BaseValidator:
         raise NotImplementedError("get_dataloader function not implemented for this validator")
 
     def build_dataset(self, img_path):
-        """Build dataset."""
+        """Build dataset from image path."""
         raise NotImplementedError("build_dataset function not implemented in validator")
 
     def preprocess(self, batch):
-        """Preprocesses an input batch."""
+        """Preprocess an input batch."""
+        return batch
+
+    def preprocess_targets(self, batch: dict) -> dict:
+        """Move annotations to the model device, keeping full-resolution evaluation images on the host."""
+        for key, value in batch.items():
+            if key != "img" and isinstance(value, torch.Tensor):
+                batch[key] = value.to(self.device, non_blocking=self.device.type not in {"cpu", "mps"})
         return batch
 
     def postprocess(self, preds):
-        """Preprocesses the predictions."""
+        """Postprocess the predictions."""
         return preds
 
     def init_metrics(self, model):
         """Initialize performance metrics for the YOLO model."""
-        pass
 
     def update_metrics(self, preds, batch):
-        """Updates metrics based on predictions and batch."""
-        pass
+        """Update metrics based on predictions and batch."""
 
-    def finalize_metrics(self, *args, **kwargs):
-        """Finalizes and returns all metrics."""
-        pass
+    def finalize_metrics(self):
+        """Finalize and return all metrics."""
 
     def get_stats(self):
-        """Returns statistics about the model's performance."""
+        """Return statistics about the model's performance."""
         return {}
 
-    def check_stats(self, stats):
-        """Checks statistics."""
-        pass
+    def gather_stats(self):
+        """Gather statistics from all the GPUs during DDP training to GPU 0."""
 
     def print_results(self):
-        """Prints the results of the model's predictions."""
-        pass
+        """Print the results of the model's predictions."""
 
     def get_desc(self):
         """Get description of the YOLO model."""
-        pass
 
     @property
     def metric_keys(self):
-        """Returns the metric keys used in YOLO training/validation."""
+        """Return the metric keys used in YOLO training/validation."""
         return []
 
     def on_plot(self, name, data=None):
-        """Registers plots (e.g. to be consumed in callbacks)."""
+        """Register a plot by its unique path for visualization and logging."""
         self.plots[Path(name)] = {"data": data, "timestamp": time.time()}
 
-    # TODO: may need to put these following functions into callback
     def plot_val_samples(self, batch, ni):
-        """Plots validation samples during training."""
-        pass
+        """Plot validation samples during training."""
 
     def plot_predictions(self, batch, preds, ni):
-        """Plots YOLO model predictions on batch images."""
-        pass
+        """Plot YOLO model predictions on batch images."""
 
     def pred_to_json(self, preds, batch):
         """Convert predictions to JSON format."""
-        pass
 
     def eval_json(self, stats):
         """Evaluate and return JSON format of prediction statistics."""
-        pass

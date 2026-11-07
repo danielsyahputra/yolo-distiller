@@ -1,55 +1,128 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
 
 import contextlib
 import importlib.metadata
 import inspect
 import json
-import logging.config
+import logging
 import os
 import platform
 import re
-import subprocess
+import socket
+import stat
 import sys
+import tempfile
 import threading
 import time
-import urllib
-import uuid
+import warnings
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
-from typing import Union
+from urllib.parse import unquote
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import yaml
-from tqdm import tqdm as tqdm_original
+
+try:
+    import torch
+except ImportError:  # torch 1.10-1.12 x86_64 wheels request an executable stack that glibc>=2.41 refuses
+    from ultralytics.utils.files import import_execstack
+
+    torch = import_execstack("torch", "torch/lib/*.so*")
 
 from ultralytics import __version__
+from ultralytics.utils.git import GitRepo
+from ultralytics.utils.patches import imread as imread  # re-export for backwards compatibility
+from ultralytics.utils.patches import imread_unicode, imshow, imwrite, torch_save  # for patches
+from ultralytics.utils.tqdm import TQDM  # noqa
 
-# PyTorch Multi-GPU DDP Constants
-RANK = int(os.getenv("RANK", -1))
-LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable, accepting common truthy strings.
+
+    Accepts "1", "true", "yes", "on", "y", "t" (case-insensitive, whitespace-trimmed) as True; any other set value is
+    False. The default is returned only when the variable is unset, not when it is set to an empty string.
+
+    Args:
+        name (str): Environment variable name.
+        default (bool): Value returned when the variable is unset.
+
+    Returns:
+        (bool): Parsed boolean value.
+
+    Examples:
+        >>> env_bool("YOLO_UNSET_EXAMPLE_VAR", True)  # returns the default when the variable is unset
+        True
+    """
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+# PyTorch Multi-GPU DDP Constants, trusted only in real DDP workers, i.e. WORLD_SIZE > 1 (#16446)
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
+RANK = int(os.getenv("RANK", "-1")) if WORLD_SIZE > 1 else -1
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1")) if WORLD_SIZE > 1 else -1
 
 # Other Constants
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO
 ASSETS = ROOT / "assets"  # default images
+ASSETS_URL = "https://github.com/ultralytics/assets/releases/download/v0.0.0"  # assets GitHub URL
+# Hosts like upload.wikimedia.org reject the python-requests default User-Agent
+REQUEST_HEADERS = {"User-Agent": f"ultralytics/{__version__} (https://ultralytics.com)"}
+# Configurable Platform URL for debugging (e.g. ULTRALYTICS_PLATFORM_URL=http://localhost:3000)
+PLATFORM_URL = os.getenv("ULTRALYTICS_PLATFORM_URL", "https://platform.ultralytics.com").rstrip("/")
 DEFAULT_CFG_PATH = ROOT / "cfg/default.yaml"
-DEFAULT_SOL_CFG_PATH = ROOT / "cfg/solutions/default.yaml"  # Ultralytics solutions yaml path
 NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLO multiprocessing threads
-AUTOINSTALL = str(os.getenv("YOLO_AUTOINSTALL", True)).lower() == "true"  # global auto-install mode
-VERBOSE = str(os.getenv("YOLO_VERBOSE", True)).lower() == "true"  # global verbose mode
-TQDM_BAR_FORMAT = "{l_bar}{bar:10}{r_bar}" if VERBOSE else None  # tqdm bar format
+AUTOINSTALL = env_bool("YOLO_AUTOINSTALL", True)  # global auto-install mode
+VERBOSE = env_bool("YOLO_VERBOSE", True)  # global verbose mode
+SAFE_LOAD = env_bool("ULTRALYTICS_SAFE_LOAD")  # opt-in weights_only model loading
 LOGGING_NAME = "ultralytics"
 MACOS, LINUX, WINDOWS = (platform.system() == x for x in ["Darwin", "Linux", "Windows"])  # environment booleans
+MACOS_VERSION = platform.mac_ver()[0] if MACOS else None
+NOT_MACOS14 = not (MACOS and MACOS_VERSION.startswith("14."))
 ARM64 = platform.machine() in {"arm64", "aarch64"}  # ARM64 booleans
 PYTHON_VERSION = platform.python_version()
-TORCH_VERSION = torch.__version__
+TORCH_VERSION = str(torch.__version__)  # Normalize torch.__version__ (PyTorch>1.9 returns TorchVersion objects)
 TORCHVISION_VERSION = importlib.metadata.version("torchvision")  # faster than importing torchvision
-IS_VSCODE = os.environ.get("TERM_PROGRAM", False) == "vscode"
+IS_VSCODE = os.environ.get("TERM_PROGRAM") == "vscode"
+RKNN_CHIPS = frozenset(
+    {
+        "rk3588",
+        "rk3576",
+        "rk3566",
+        "rk3568",
+        "rk3562",
+        "rv1103",
+        "rv1106",
+        "rv1103b",
+        "rv1106b",
+        "rk2118",
+        "rv1126b",
+    }
+)  # Rockchip processors available for export
+QNN_HTP_TARGETS = {
+    "68": ("htp_arch", "68"),  # Snapdragon 888
+    "69": ("htp_arch", "69"),  # Snapdragon 8 Gen 1
+    "73": ("htp_arch", "73"),  # Snapdragon 8 Gen 2 / X Elite
+    "75": ("htp_arch", "75"),  # Snapdragon 8 Gen 3
+    "79": ("soc_model", "69"),  # Snapdragon 8 Elite (SM8750)
+    "81": ("htp_arch", "81"),  # Snapdragon 8 Elite Gen 5
+    "iq-8275": ("soc_model", "82"),  # Dragonwing IQ-8275
+    "qcs8275": ("soc_model", "82"),
+}  # Qualcomm Hexagon HTP targets and their ONNX Runtime QNN provider option
+XILINX_TARGETS = (
+    "ve2-xc2ve3858",
+    "ve2-xc2ve3504",
+    "ve2-xc2ve3558",
+    "ve2-xc2ve3804",
+    "ve2-xc2ve3304",
+    "ve2-xc2ve3358",
+)  # AMD Versal AI Edge Series Gen 2 Vitis AI compiler devices, the first is the VEK385 evaluation kit default
 HELP_MSG = """
     Examples for running Ultralytics:
 
@@ -62,8 +135,8 @@ HELP_MSG = """
         from ultralytics import YOLO
 
         # Load a model
-        model = YOLO("yolo11n.yaml")  # build a new model from scratch
-        model = YOLO("yolo11n.pt")  # load a pretrained model (recommended for training)
+        model = YOLO("yolo26n.yaml")  # build a new model from scratch
+        model = YOLO("yolo26n.pt")  # load a pretrained model (recommended for training)
 
         # Use the model
         results = model.train(data="coco8.yaml", epochs=3)  # train the model
@@ -77,22 +150,22 @@ HELP_MSG = """
 
             yolo TASK MODE ARGS
 
-            Where   TASK (optional) is one of [detect, segment, classify, pose, obb]
+            Where   TASK (optional) is one of [detect, segment, semantic, depth, classify, pose, obb]
                     MODE (required) is one of [train, val, predict, export, track, benchmark]
                     ARGS (optional) are any number of custom "arg=value" pairs like "imgsz=320" that override defaults.
                         See all ARGS at https://docs.ultralytics.com/usage/cfg or with "yolo cfg"
 
         - Train a detection model for 10 epochs with an initial learning_rate of 0.01
-            yolo detect train data=coco8.yaml model=yolo11n.pt epochs=10 lr0=0.01
+            yolo detect train data=coco8.yaml model=yolo26n.pt epochs=10 lr0=0.01
 
         - Predict a YouTube video using a pretrained segmentation model at image size 320:
-            yolo segment predict model=yolo11n-seg.pt source='https://youtu.be/LNwODJXcvt4' imgsz=320
+            yolo segment predict model=yolo26n-seg.pt source='https://youtu.be/LNwODJXcvt4' imgsz=320
 
         - Val a pretrained detection model at batch-size 1 and image size 640:
-            yolo detect val model=yolo11n.pt data=coco8.yaml batch=1 imgsz=640
+            yolo detect val model=yolo26n.pt data=coco8.yaml batch=1 imgsz=640
 
-        - Export a YOLO11n classification model to ONNX format at image size 224 by 128 (no TASK required)
-            yolo export model=yolo11n-cls.pt format=onnx imgsz=224,128
+        - Export a YOLO26n classification model to ONNX format at image size 224 by 128 (no TASK required)
+            yolo export model=yolo26n-cls.pt format=onnx imgsz=224,128
 
         - Run special commands:
             yolo help
@@ -112,71 +185,114 @@ torch.set_printoptions(linewidth=320, precision=4, profile="default")
 np.set_printoptions(linewidth=320, formatter={"float_kind": "{:11.5g}".format})  # format short g, %precision=5
 cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
 os.environ["NUMEXPR_MAX_THREADS"] = str(NUM_THREADS)  # NumExpr max threads
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic training to avoid CUDA warning
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress verbose TF compiler warnings in Colab
 os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"  # suppress "NNPACK.cpp could not initialize NNPACK" warnings
 os.environ["KINETO_LOG_LEVEL"] = "5"  # suppress verbose PyTorch profiler output when computing FLOPs
 
+# Centralized warning suppression
+warnings.filterwarnings("ignore", message="torch.distributed.reduce_op is deprecated")  # PyTorch deprecation
+warnings.filterwarnings("ignore", message="TRITON_DEFAULT_FP_FUSION is unset")  # torch 2.15 eager bmm, Triton 3.9
+warnings.filterwarnings("ignore", message="The figure layout has changed to tight")  # matplotlib>=3.7.2
+warnings.filterwarnings("ignore", category=FutureWarning, module="timm")  # mobileclip timm.layers deprecation
+warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)  # ONNX/TorchScript export tracer warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*prim::Constant.*")  # ONNX shape warning
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="coremltools")  # CoreML np.bool deprecation
+logging.getLogger("coremltools").setLevel(logging.ERROR)  # Suppress native binary load failures on non-macOS
 
-class TQDM(tqdm_original):
-    """
-    A custom TQDM progress bar class that extends the original tqdm functionality.
+# Precompiled type tuples for faster isinstance() checks
+FLOAT_OR_INT = (float, int)
+STR_OR_PATH = (str, Path)
 
-    This class modifies the behavior of the original tqdm progress bar based on global settings and provides
-    additional customization options.
 
-    Attributes:
-        disable (bool): Whether to disable the progress bar. Determined by the global VERBOSE setting and
-            any passed 'disable' argument.
-        bar_format (str): The format string for the progress bar. Uses the global TQDM_BAR_FORMAT if not
-            explicitly set.
+class DataExportMixin:
+    """Mixin class for exporting validation metrics or prediction results in various formats.
+
+    This class provides utilities to export performance metrics (e.g., mAP, precision, recall) or prediction results
+    from detection, segmentation, depth, classification, or pose estimation tasks into various formats: Polars
+    DataFrame, CSV, and JSON. Subclasses must implement a `summary(normalize, decimals)` method.
 
     Methods:
-        __init__: Initializes the TQDM object with custom settings.
+        to_df: Convert summary to a Polars DataFrame.
+        to_csv: Export results as a CSV string.
+        to_json: Export results as a JSON string.
 
     Examples:
-        >>> from ultralytics.utils import TQDM
-        >>> for i in TQDM(range(100)):
-        ...     # Your processing code here
-        ...     pass
+        >>> from ultralytics import YOLO
+        >>> model = YOLO("yolo26n.pt")
+        >>> results = model("image.jpg")
+        >>> df = results[0].to_df()
+        >>> print(df)
+        >>> csv_data = results[0].to_csv()
     """
 
-    def __init__(self, *args, **kwargs):
-        """
-        Initializes a custom TQDM progress bar.
-
-        This class extends the original tqdm class to provide customized behavior for Ultralytics projects.
+    def to_df(self, normalize=False, decimals=5):
+        """Create a Polars DataFrame from the prediction results summary or validation metrics.
 
         Args:
-            *args (Any): Variable length argument list to be passed to the original tqdm constructor.
-            **kwargs (Any): Arbitrary keyword arguments to be passed to the original tqdm constructor.
+            normalize (bool, optional): Normalize numerical values for easier comparison.
+            decimals (int, optional): Decimal places to round floats.
 
-        Notes:
-            - The progress bar is disabled if VERBOSE is False or if 'disable' is explicitly set to True in kwargs.
-            - The default bar format is set to TQDM_BAR_FORMAT unless overridden in kwargs.
-
-        Examples:
-            >>> from ultralytics.utils import TQDM
-            >>> for i in TQDM(range(100)):
-            ...     # Your code here
-            ...     pass
+        Returns:
+            (polars.DataFrame): Polars DataFrame containing the summary data.
         """
-        kwargs["disable"] = not VERBOSE or kwargs.get("disable", False)  # logical 'and' with default value if passed
-        kwargs.setdefault("bar_format", TQDM_BAR_FORMAT)  # override default value if passed
-        super().__init__(*args, **kwargs)
+        import polars as pl  # scope for faster 'import ultralytics'
+
+        return pl.DataFrame(self.summary(normalize=normalize, decimals=decimals))
+
+    def to_csv(self, normalize=False, decimals=5):
+        """Export results or metrics to CSV string format.
+
+        Args:
+            normalize (bool, optional): Normalize numeric values.
+            decimals (int, optional): Decimal precision.
+
+        Returns:
+            (str): CSV content as string.
+        """
+        import polars as pl
+
+        df = self.to_df(normalize=normalize, decimals=decimals)
+
+        try:
+            return df.write_csv()
+        except Exception:
+            # Minimal string conversion for any remaining complex types
+            def _to_str_simple(v):
+                if v is None:
+                    return ""
+                elif isinstance(v, (dict, list, tuple, set)):
+                    return repr(v)
+                else:
+                    return str(v)
+
+            df_str = df.select(
+                [pl.col(c).map_elements(_to_str_simple, return_dtype=pl.String).alias(c) for c in df.columns]
+            )
+            return df_str.write_csv()
+
+    def to_json(self, normalize=False, decimals=5):
+        """Export results to JSON format.
+
+        Args:
+            normalize (bool, optional): Normalize numeric values.
+            decimals (int, optional): Decimal precision.
+
+        Returns:
+            (str): JSON-formatted string of the results.
+        """
+        return self.to_df(normalize=normalize, decimals=decimals).write_json()
 
 
 class SimpleClass:
-    """
-    A simple base class for creating objects with string representations of their attributes.
+    """A simple base class for creating objects with string representations of their attributes.
 
-    This class provides a foundation for creating objects that can be easily printed or represented as strings,
-    showing all their non-callable attributes. It's useful for debugging and introspection of object states.
+    This class provides a foundation for creating objects that can be easily printed or represented as strings, showing
+    all their non-callable attributes. It's useful for debugging and introspection of object states.
 
     Methods:
-        __str__: Returns a human-readable string representation of the object.
-        __repr__: Returns a machine-readable string representation of the object.
-        __getattr__: Provides a custom attribute access error message with helpful information.
+        __str__: Return a human-readable string representation of the object.
+        __repr__: Return a machine-readable string representation of the object.
+        __getattr__: Provide a custom attribute access error message with helpful information.
 
     Examples:
         >>> class MyClass(SimpleClass):
@@ -184,11 +300,7 @@ class SimpleClass:
         ...         self.x = 10
         ...         self.y = "hello"
         >>> obj = MyClass()
-        >>> print(obj)
-        __main__.MyClass object with attributes:
-
-        x: 10
-        y: 'hello'
+        >>> text = str(obj)  # "<module>.MyClass object with attributes:" followed by "x: 10" and "y: 'hello'"
 
     Notes:
         - This class is designed to be subclassed. It provides a convenient way to inspect object attributes.
@@ -206,7 +318,7 @@ class SimpleClass:
                     # Display only the module and class name for subclasses
                     s = f"{a}: {v.__module__}.{v.__class__.__name__} object"
                 else:
-                    s = f"{a}: {repr(v)}"
+                    s = f"{a}: {v!r}"
                 attr.append(s)
         return f"{self.__module__}.{self.__class__.__name__} object with attributes:\n\n" + "\n".join(attr)
 
@@ -215,24 +327,23 @@ class SimpleClass:
         return self.__str__()
 
     def __getattr__(self, attr):
-        """Custom attribute access error message with helpful information."""
+        """Provide a custom attribute access error message with helpful information."""
         name = self.__class__.__name__
         raise AttributeError(f"'{name}' object has no attribute '{attr}'. See valid attributes below.\n{self.__doc__}")
 
 
 class IterableSimpleNamespace(SimpleNamespace):
-    """
-    An iterable SimpleNamespace class that provides enhanced functionality for attribute access and iteration.
+    """An iterable SimpleNamespace class that provides enhanced functionality for attribute access and iteration.
 
-    This class extends the SimpleNamespace class with additional methods for iteration, string representation,
-    and attribute access. It is designed to be used as a convenient container for storing and accessing
-    configuration parameters.
+    This class extends the SimpleNamespace class with additional methods for iteration, string representation, and
+    attribute access. It is designed to be used as a convenient container for storing and accessing configuration
+    parameters.
 
     Methods:
-        __iter__: Returns an iterator of key-value pairs from the namespace's attributes.
-        __str__: Returns a human-readable string representation of the object.
-        __getattr__: Provides a custom attribute access error message with helpful information.
-        get: Retrieves the value of a specified key, or a default value if the key doesn't exist.
+        __iter__: Return an iterator of key-value pairs from the namespace's attributes.
+        __str__: Return a human-readable string representation of the object.
+        __getattr__: Provide a custom attribute access error message with helpful information.
+        get: Retrieve the value of a specified key, or a default value if the key doesn't exist.
 
     Examples:
         >>> cfg = IterableSimpleNamespace(a=1, b=2, c=3)
@@ -264,7 +375,7 @@ class IterableSimpleNamespace(SimpleNamespace):
         return "\n".join(f"{k}={v}" for k, v in vars(self).items())
 
     def __getattr__(self, attr):
-        """Custom attribute access error message with helpful information."""
+        """Provide a custom attribute access error message with helpful information."""
         name = self.__class__.__name__
         raise AttributeError(
             f"""
@@ -281,20 +392,23 @@ class IterableSimpleNamespace(SimpleNamespace):
 
 
 def plt_settings(rcparams=None, backend="Agg"):
-    """
-    Decorator to temporarily set rc parameters and the backend for a plotting function.
-
-    Example:
-        decorator: @plt_settings({"font.size": 12})
-        context manager: with plt_settings({"font.size": 12}):
+    """Decorator to temporarily set rc parameters and the backend for a plotting function.
 
     Args:
-        rcparams (dict): Dictionary of rc parameters to set.
-        backend (str, optional): Name of the backend to use. Defaults to 'Agg'.
+        rcparams (dict, optional): Dictionary of rc parameters to set. Defaults to {"font.size": 11}.
+        backend (str, optional): Name of the backend to use.
 
     Returns:
-        (Callable): Decorated function with temporarily set rc parameters and backend. This decorator can be
-            applied to any function that needs to have specific matplotlib rc parameters and backend for its execution.
+        (Callable): Decorator that runs the wrapped function with temporarily set rc parameters and backend.
+
+    Examples:
+        >>> import matplotlib.pyplot as plt
+        >>> from ultralytics.utils import plt_settings
+        >>> @plt_settings({"font.size": 12})
+        ... def plot_function():
+        ...     plt.figure()
+        ...     plt.plot([1, 2, 3])
+        ...     plt.savefig("plot.png")
     """
     if rcparams is None:
         rcparams = {"font.size": 11}
@@ -303,39 +417,67 @@ def plt_settings(rcparams=None, backend="Agg"):
         """Decorator to apply temporary rc parameters and backend to a function."""
 
         def wrapper(*args, **kwargs):
-            """Sets rc parameters and backend, calls the original function, and restores the settings."""
+            """Set rc parameters and backend, call the original function, and restore the settings."""
+            import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
+
+            # Prepend Arial Unicode for non-Latin text (CJK, Arabic, etc.); matplotlib falls back if missing
+            if "font.sans-serif" not in rcparams and not wrapper._fonts_registered:
+                from matplotlib import font_manager
+
+                # Register any fonts in Ultralytics config dir (e.g. Arial.Unicode.ttf) with matplotlib
+                known = {f.fname for f in font_manager.fontManager.ttflist}
+                for f in USER_CONFIG_DIR.glob("*.ttf"):
+                    if str(f) not in known:
+                        font_manager.fontManager.addfont(str(f))
+                wrapper._fonts_registered = True
+            rc = (
+                rcparams
+                if "font.sans-serif" in rcparams
+                else {**rcparams, "font.sans-serif": ["Arial Unicode MS", *plt.rcParams.get("font.sans-serif", [])]}
+            )
+
             original_backend = plt.get_backend()
             switch = backend.lower() != original_backend.lower()
             if switch:
+                # Resolve configured backends first, as get_backend() may return an unavailable backend name
+                if plt._backend_mod is None:
+                    try:
+                        plt.switch_backend(original_backend)
+                    except ImportError:
+                        original_backend = None
                 plt.close("all")  # auto-close()ing of figures upon backend switching is deprecated since 3.8
                 plt.switch_backend(backend)
 
             # Plot with backend and always revert to original backend
             try:
-                with plt.rc_context(rcparams):
+                with plt.rc_context(rc):
                     result = func(*args, **kwargs)
             finally:
                 if switch:
                     plt.close("all")
-                    plt.switch_backend(original_backend)
+                    if original_backend:
+                        plt.switch_backend(original_backend)
             return result
 
+        wrapper._fonts_registered = False
         return wrapper
 
     return decorator
 
 
-def set_logging(name="LOGGING_NAME", verbose=True):
-    """
-    Sets up logging with UTF-8 encoding and configurable verbosity.
+def set_logging(name=LOGGING_NAME, verbose=True):
+    """Set up logging with UTF-8 encoding and configurable verbosity.
 
-    This function configures logging for the Ultralytics library, setting the appropriate logging level and
-    formatter based on the verbosity flag and the current process rank. It handles special cases for Windows
-    environments where UTF-8 encoding might not be the default.
+    This function configures logging for the Ultralytics library, setting the appropriate logging level and formatter
+    based on the verbosity flag and the current process rank. It handles special cases for Windows environments where
+    UTF-8 encoding might not be the default.
 
     Args:
-        name (str): Name of the logger. Defaults to "LOGGING_NAME".
-        verbose (bool): Flag to set logging level to INFO if True, ERROR otherwise. Defaults to True.
+        name (str): Name of the logger.
+        verbose (bool): Flag to set logging level to INFO if True, ERROR otherwise.
+
+    Returns:
+        (logging.Logger): Configured logger object.
 
     Examples:
         >>> set_logging(name="ultralytics", verbose=True)
@@ -344,22 +486,32 @@ def set_logging(name="LOGGING_NAME", verbose=True):
 
     Notes:
         - On Windows, this function attempts to reconfigure stdout to use UTF-8 encoding if possible.
-        - If reconfiguration is not possible, it falls back to a custom formatter that handles non-UTF-8 environments.
+        - On Windows, emojis are removed from log messages.
         - The function sets up a StreamHandler with the appropriate formatter and level.
         - The logger's propagate flag is set to False to prevent duplicate logging in parent loggers.
     """
     level = logging.INFO if verbose and RANK in {-1, 0} else logging.ERROR  # rank in world for Multi-GPU trainings
 
-    # Configure the console (stdout) encoding to UTF-8, with checks for compatibility
-    formatter = logging.Formatter("%(message)s")  # Default formatter
+    class PrefixFormatter(logging.Formatter):
+        def format(self, record):
+            """Format log records with prefixes based on level."""
+            # Apply prefixes based on log level
+            if record.levelno == logging.WARNING:
+                prefix = "WARNING" if WINDOWS else "WARNING ⚠️"
+                record.msg = f"{prefix} {record.msg}"
+            elif record.levelno == logging.ERROR:
+                prefix = "ERROR" if WINDOWS else "ERROR ❌"
+                record.msg = f"{prefix} {record.msg}"
+
+            # Handle emojis in message based on platform
+            formatted_message = super().format(record)
+            return emojis(formatted_message)
+
+    formatter = PrefixFormatter("%(message)s")
+
+    # Handle Windows UTF-8 encoding issues
     if WINDOWS and hasattr(sys.stdout, "encoding") and sys.stdout.encoding != "utf-8":
-
-        class CustomFormatter(logging.Formatter):
-            def format(self, record):
-                """Sets up logging with UTF-8 encoding and configurable verbosity."""
-                return emojis(super().format(record))
-
-        try:
+        with contextlib.suppress(Exception):
             # Attempt to reconfigure stdout to use UTF-8 encoding if possible
             if hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(encoding="utf-8")
@@ -368,19 +520,17 @@ def set_logging(name="LOGGING_NAME", verbose=True):
                 import io
 
                 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-            else:
-                formatter = CustomFormatter("%(message)s")
-        except Exception as e:
-            print(f"Creating custom formatter for non UTF-8 environments due to {e}")
-            formatter = CustomFormatter("%(message)s")
 
     # Create and configure the StreamHandler with the appropriate formatter and level
     stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.set_name("ultralytics.utils.set_logging")
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(level)
 
     # Set up the logger
     logger = logging.getLogger(name)
+    for h in [h for h in logger.handlers if h.name == stream_handler.name]:
+        logger.removeHandler(h)
     logger.setLevel(level)
     logger.addHandler(stream_handler)
     logger.propagate = False
@@ -389,36 +539,32 @@ def set_logging(name="LOGGING_NAME", verbose=True):
 
 # Set logger
 LOGGER = set_logging(LOGGING_NAME, verbose=VERBOSE)  # define globally (used in train.py, val.py, predict.py, etc.)
-for logger in "sentry_sdk", "urllib3.connectionpool":
-    logging.getLogger(logger).setLevel(logging.CRITICAL + 1)
+logging.getLogger("sentry_sdk").setLevel(logging.CRITICAL + 1)
 
 
 def emojis(string=""):
-    """Return platform-dependent emoji-safe version of string."""
-    return string.encode().decode("ascii", "ignore") if WINDOWS else string
+    """Return platform-dependent emoji-safe version of string, removing only the package's emojis on Windows."""
+    return string.translate(str.maketrans("", "", "🚀✅❌⚠💡⚡⏱❎❔😃\ufe0f")) if WINDOWS else string
 
 
 class ThreadingLocked:
-    """
-    A decorator class for ensuring thread-safe execution of a function or method. This class can be used as a decorator
-    to make sure that if the decorated function is called from multiple threads, only one thread at a time will be able
-    to execute the function.
+    """A decorator class for ensuring thread-safe execution of a function or method.
+
+    This class can be used as a decorator to make sure that if the decorated function is called from multiple threads,
+    only one thread at a time will be able to execute the function.
 
     Attributes:
         lock (threading.Lock): A lock object used to manage access to the decorated function.
 
-    Example:
-        ```python
-        from ultralytics.utils import ThreadingLocked
-
-        @ThreadingLocked()
-        def my_function():
-            # Your code here
-        ```
+    Examples:
+        >>> from ultralytics.utils import ThreadingLocked
+        >>> @ThreadingLocked()
+        ... def my_function():
+        ...     pass  # your code here
     """
 
     def __init__(self):
-        """Initializes the decorator class for thread-safe execution of a function or method."""
+        """Initialize the decorator class with a threading lock."""
         self.lock = threading.Lock()
 
     def __call__(self, f):
@@ -427,114 +573,420 @@ class ThreadingLocked:
 
         @wraps(f)
         def decorated(*args, **kwargs):
-            """Applies thread-safety to the decorated function or method."""
+            """Apply thread-safety to the decorated function or method."""
             with self.lock:
                 return f(*args, **kwargs)
 
         return decorated
 
 
-def yaml_save(file="data.yaml", data=None, header=""):
-    """
-    Save YAML data to a file.
+class YAML:
+    """Minimal YAML reader and writer for Ultralytics configs, datasets and export metadata.
 
-    Args:
-        file (str, optional): File name. Default is 'data.yaml'.
-        data (dict): Data to save in YAML format.
-        header (str, optional): YAML header to add.
+    Parses the YAML these files use: block mappings and sequences, flow collections, plain, quoted and block scalars,
+    and comments. Plain scalars resolve with YAML 1.2 core rules plus Python's None/True/False spellings, so `yes`,
+    `no`, `on` and `off` stay strings and `1e-3` is a float. Anchors, aliases, tags and complex keys raise ValueError.
+    Saved files write nested dicts as blocks and other values inline, readable by any YAML parser.
 
-    Returns:
-        (None): Data is saved to the specified file.
+    Examples:
+        >>> from ultralytics.utils import YAML
+        >>> data = YAML.load("config.yaml")
+        >>> data["new_value"] = 123
+        >>> YAML.save("updated_config.yaml", data)
+        >>> YAML.print(data)
     """
-    if data is None:
-        data = {}
-    file = Path(file)
-    if not file.parent.exists():
-        # Create parent directories if they don't exist
+
+    _CONST = {
+        **dict.fromkeys(("", "~", "null", "Null", "NULL", "None")),
+        **dict.fromkeys(("true", "True", "TRUE"), True),
+        **dict.fromkeys(("false", "False", "FALSE"), False),
+        **dict.fromkeys((".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF"), float("inf")),
+        **dict.fromkeys(("-.inf", "-.Inf", "-.INF"), float("-inf")),
+        **dict.fromkeys((".nan", ".NaN", ".NAN"), float("nan")),
+    }
+    _ESC = dict(zip('0abt\tnvfre "/\\N_LP', '\0\a\b\t\t\n\v\f\r\x1b "/\\\x85\xa0\u2028\u2029'))
+    _YAML11 = {"y", "n", "yes", "no", "on", "off"}  # quoted on save so YAML 1.1 readers keep them strings
+    _COMMENT = re.compile(r"[ \t]#")
+    _QUOTED = re.compile(r""""(?:[^"\\]|\\[\s\S])*"|'(?:[^']|'')*'(?!')""")
+    _FLOW = re.compile(  # flow token: quoted scalar | indicator | comment | plain scalar
+        rf"\s*(?:({_QUOTED.pattern})|([\[\]{{}},:])|(#.*)|([^\s,\[\]{{}}#](?:[^,\[\]{{}}:#]|:(?=[^\s,\[\]{{}}])|(?<=\S)#)*))"
+    )
+    _FOLD = r"[ \t]*\n((?:[ \t]*\n)*)[ \t]*"  # quoted line break: one folds to a space, n + 1 to n newlines
+    _DQ = re.compile(rf"\\(x[0-9A-Fa-f]{{2}}|u[0-9A-Fa-f]{{4}}|U[0-9A-Fa-f]{{8}}|\n[ \t]*|[\s\S])|{_FOLD}")
+    _PLAIN = re.compile(r"(?:\.\.?/|[^\s\d+.\-?:,\[\]{}#&*!|>'\"%@`<=])(?:[^\n\r\t:#]|:(?! |$)|(?<! )#)*(?<! )")
+
+    def __init__(self, text: str):
+        """Split a YAML document into lines for `parse()`."""
+        self.lines = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        self.i = 0
+
+    @classmethod
+    def save(cls, file="data.yaml", data=None, header=""):
+        """Save Python object as YAML file.
+
+        Args:
+            file (str | Path): Path to save YAML file.
+            data (dict | None): Dict to save. Top-level values of non-YAML-serializable types are converted to strings
+                in place.
+            header (str): Optional string to add at file beginning.
+        """
+        if data is None:
+            data = {}
+
+        # Create parent directories if needed
+        file = Path(file)
         file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Convert Path objects to strings
-    valid_types = int, float, str, bool, list, tuple, dict, type(None)
-    for k, v in data.items():
-        if not isinstance(v, valid_types):
-            data[k] = str(v)
+        # Convert non-serializable objects to strings
+        valid_types = int, float, str, bool, list, tuple, dict, type(None)
+        for k, v in data.items():
+            if not isinstance(v, valid_types):
+                data[k] = str(v)
 
-    # Dump data to file in YAML format
-    with open(file, "w", errors="ignore", encoding="utf-8") as f:
-        if header:
-            f.write(header)
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+        # Write YAML file
+        with open(file, "w", errors="ignore", encoding="utf-8") as f:
+            f.write(header + cls._dump(data))
 
+    @classmethod
+    def load(cls, file="data.yaml", append_filename=False):
+        """Load YAML file to Python object.
 
-def yaml_load(file="data.yaml", append_filename=False):
-    """
-    Load YAML data from a file.
+        Args:
+            file (str | Path): Path to YAML file.
+            append_filename (bool): Whether to add filename to returned dict.
 
-    Args:
-        file (str, optional): File name. Default is 'data.yaml'.
-        append_filename (bool): Add the YAML filename to the YAML dictionary. Default is False.
+        Returns:
+            (dict): Loaded YAML content, or an empty dict for an empty file.
 
-    Returns:
-        (dict): YAML data and file name.
-    """
-    assert Path(file).suffix in {".yaml", ".yml"}, f"Attempting to load non-YAML file {file} with yaml_load()"
-    with open(file, errors="ignore", encoding="utf-8") as f:
-        s = f.read()  # string
+        Raises:
+            AssertionError: If the file does not have a .yaml or .yml suffix.
+            ValueError: If the file contains a YAML syntax error or is not a YAML mapping.
+        """
+        assert str(file).lower().endswith((".yaml", ".yml")), f"Not a YAML file: {file}"
+        with open(file, errors="ignore", encoding="utf-8") as f:
+            s = f.read()
+        try:
+            data = cls(s).parse()
+        except Exception as e:
+            raise ValueError(
+                f"YAML syntax error in '{file}': {e}\nVerify YAML with https://ray.run/tools/yaml-formatter"
+            ) from None
 
-        # Remove special characters
-        if not s.isprintable():
-            s = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\x85\xA0-\uD7FF\uE000-\uFFFD\U00010000-\U0010ffff]+", "", s)
+        if data is None:  # empty file, comments only, or explicit 'null'
+            data = {}
+        elif not isinstance(data, dict):  # reject non-mapping YAML (scalar/list) with a clear error, not a cryptic one
+            raise ValueError(
+                f"'{file}' is not a valid YAML mapping. Verify YAML with https://ray.run/tools/yaml-formatter"
+            )
 
-        # Add YAML filename to dict and return
-        data = yaml.safe_load(s) or {}  # always return a dict (yaml.safe_load() may return None for empty files)
         if append_filename:
             data["yaml_file"] = str(file)
         return data
 
+    @classmethod
+    def print(cls, yaml_file):
+        """Pretty print YAML file or object to console.
 
-def yaml_print(yaml_file: Union[str, Path, dict]) -> None:
-    """
-    Pretty prints a YAML file or a YAML-formatted dictionary.
+        Args:
+            yaml_file (str | Path | dict): Path to YAML file or dict to print.
+        """
+        yaml_dict = cls.load(yaml_file) if isinstance(yaml_file, (str, Path)) else yaml_file
+        LOGGER.info(f"Printing '{colorstr('bold', 'black', yaml_file)}'\n\n{cls._dump(yaml_dict)}")
 
-    Args:
-        yaml_file: The file path of the YAML file or a YAML-formatted dictionary.
+    @classmethod
+    def _dump(cls, v, indent: str = "") -> str:
+        """Serialize a dict or list in PyYAML's block layout, with scalars and empty collections inline."""
+        out = []
+        for k, x in v.items() if isinstance(v, dict) else enumerate(v):
+            head = f"{indent}{cls._repr(k)}:" if isinstance(v, dict) else f"{indent}-"
+            if isinstance(x, (dict, list, tuple)) and x:
+                if isinstance(v, dict):  # nested dict indented, nested list at the key's indent like PyYAML
+                    out.append(f"{head}\n{cls._dump(x, indent + '  ' if isinstance(x, dict) else indent)}")
+                else:  # '- - x' and '- k: v' put the item's first line after its dash
+                    out.append(f"{head} {cls._dump(x, indent + '  ')[len(indent) + 2 :]}")
+            else:
+                out.append(f"{head} {cls._repr(x)}\n")
+        return "".join(out)
 
-    Returns:
-        (None)
-    """
-    yaml_dict = yaml_load(yaml_file) if isinstance(yaml_file, (str, Path)) else yaml_file
-    dump = yaml.dump(yaml_dict, sort_keys=False, allow_unicode=True, width=float("inf"))
-    LOGGER.info(f"Printing '{colorstr('bold', 'black', yaml_file)}'\n\n{dump}")
+    @classmethod
+    def _repr(cls, v) -> str:
+        """Represent a scalar or empty collection inline, strings plain when unambiguous and double-quoted otherwise."""
+        if v is None or v is True or v is False:
+            return {None: "null", True: "true", False: "false"}[v]
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, float):
+            s = {"nan": ".nan", "inf": ".inf", "-inf": "-.inf"}.get(r := repr(float(v)), r)  # np.float64(x) -> x
+            return s.replace("e", ".0e") if "e" in s and "." not in s else s  # '1.0e-05' so YAML 1.1 reads a float
+        if isinstance(v, (dict, list, tuple)):
+            return "{}" if isinstance(v, dict) else "[]"
+        v = str(v)
+        if v.isprintable() and cls._PLAIN.fullmatch(v) and cls._scalar(v) is v and v.lower() not in cls._YAML11:
+            return v
+        return re.sub(r"[\x7f-\x9f]", lambda m: f"\\x{ord(m[0]):02x}", json.dumps(v, ensure_ascii=False))
+
+    @classmethod
+    def _scalar(cls, s: str):
+        """Resolve a plain scalar to None, bool, int, float or str."""
+        if s in cls._CONST:
+            return cls._CONST[s]
+        if s[0] in "0123456789+-." and s[-1] in "0123456789.":
+            for f in (int, float):
+                try:
+                    return f(s)
+                except ValueError:
+                    pass
+        return s
+
+    @classmethod
+    def _unquote(cls, s: str) -> str:
+        """Decode a quoted scalar, including its quotes, by folding line breaks and resolving escapes."""
+        q, s = s[0], s[1:-1]
+        if q == "'":
+            return (re.sub(cls._FOLD, cls._fold, s) if "\n" in s else s).replace("''", "'")
+        return cls._DQ.sub(cls._escape, s) if "\\" in s or "\n" in s else s
+
+    @classmethod
+    def _escape(cls, m) -> str:
+        """Replace one double-quoted escape sequence or folded line break."""
+        e = m[1]
+        if e is None:
+            return cls._fold(m, 2)
+        if e[0] == "\n" or len(e) > 1:  # escaped line break, or \x, \u, \U code point
+            return "" if e[0] == "\n" else chr(int(e[1:], 16))
+        if e not in cls._ESC:
+            raise ValueError(f"unknown escape '\\{e}' in a double-quoted string, use single quotes for Windows paths")
+        return cls._ESC[e]
+
+    @staticmethod
+    def _fold(m, group: int = 1) -> str:
+        """Fold a matched line break: one break becomes a space, n + 1 breaks become n newlines."""
+        return "\n" * m[group].count("\n") or " "
+
+    def parse(self):
+        r"""Parse the YAML document passed to the constructor.
+
+        Returns:
+            (Any): The top-level node, usually a dict, or None for an empty document.
+
+        Raises:
+            ValueError: If the document has a syntax error or uses unsupported YAML features.
+
+        Examples:
+            >>> YAML("names:\n  0: person\nnc: 1").parse()
+            {'names': {0: 'person'}, 'nc': 1}
+        """
+        n, c = self._peek()
+        while c[:1] == "%" or c == "---" or c.startswith("--- "):  # %YAML/%TAG directives, then the document start
+            self.lines[self.i] = "" if c[0] == "%" else c[4:]
+            n, c = self._peek()
+        v = None if n < 0 else self._node(n, c, -1)
+        if (m := self._peek())[0] >= 0:  # a single document only, so '...' and later content raise
+            self._error(f"unexpected {m[1]!r}")
+        return v
+
+    def _error(self, msg):
+        """Raise a ValueError for the current line."""
+        raise ValueError(f"line {self.i + 1}: {msg}")
+
+    def _peek(self):
+        """Advance past blank and comment lines, returning (indent, content) of the next line or (-1, '') at the end."""
+        while self.i < len(self.lines):
+            line = self.lines[self.i]
+            c = line.strip(" \t")
+            if c and c[0] != "#":
+                n = len(line) - len(line.lstrip(" "))
+                if line[n] == "\t":
+                    self._error("tab indentation")
+                return n, c
+            self.i += 1
+        return -1, ""
+
+    @classmethod
+    def _key(cls, c):
+        """Split a 'key: value' line into (key, rest), or return None if it is not a mapping entry."""
+        if c[0] in "\"'":
+            m = cls._QUOTED.match(c)
+            tail = c[m.end() :].lstrip(" \t") if m else ""
+            return (cls._unquote(m[0]), tail[1:].strip(" \t")) if tail[:1] == ":" and tail[1:2] in {"", " "} else None
+        j = c.find(": ")
+        j = len(c) - 1 if j < 0 and c[-1] == ":" else j
+        k = c[:j].rstrip(" \t")
+        if j <= 0 or not k or c[0] in "[{&*!" or c[:2] == "- " or cls._COMMENT.search(k):
+            return None
+        return cls._scalar(k), c[j + 1 :].strip(" \t")
+
+    def _node(self, n, c, p):
+        """Parse the block node whose first line has indent n and content c, inside a parent node at indent p."""
+        if c == "-" or c.startswith("- "):
+            return self._seq(n)
+        if self._key(c):
+            return self._map(n)
+        self.i += 1
+        return self._value(c, p)
+
+    def _map(self, n):
+        """Parse a block mapping at indent n."""
+        d = {}
+        while True:
+            m, c = self._peek()
+            if m < n:
+                return d
+            kv = self._key(c) if m == n else None
+            if kv is None:
+                self._error(f"expected 'key: value' at indent {n}, got {c!r}")
+            self.i += 1
+            d[kv[0]] = self._value(kv[1], n)
+
+    def _seq(self, n):
+        """Parse a block sequence whose '-' indicators are at indent n."""
+        out = []
+        while True:
+            m, c = self._peek()
+            if m != n or not (c == "-" or c.startswith("- ")):
+                if m > n:
+                    self._error(f"bad indentation of {c!r}")
+                return out
+            rest = c[1:].lstrip(" ")
+            if not rest or rest[0] == "#":  # empty item: a block indented under the dash, otherwise null
+                self.i += 1
+                m, c = self._peek()
+                out.append(self._node(m, c, n) if m > n else None)
+            elif rest == "-" or rest.startswith("- ") or self._key(rest):
+                k = n + len(c) - len(rest)
+                self.lines[self.i] = " " * k + rest  # re-read '- key: v' and '- - x' as a node at the item's column
+                out.append(self._node(k, rest, n))
+            else:
+                self.i += 1
+                out.append(self._value(rest, n))
+
+    def _value(self, rest, n):
+        """Parse a value starting with text rest, on a line that belongs to a parent node at indent n."""
+        if not rest or rest[0] == "#":  # nested block, indentless sequence or null
+            m, c = self._peek()
+            return self._node(m, c, n) if m > n or (m == n and (c == "-" or c.startswith("- "))) else None
+        if rest[0] in "[{\"'":  # flow collection or quoted scalar, possibly spanning lines
+            flow, i, k = rest[0] in "[{", self.i, 0
+            while True:  # add following lines in doubling chunks so long multi-line values stay linear
+                text = "\n".join([rest, *self.lines[i : i + k]])
+                end = self._flow_end(text) if flow else (m.end() if (m := self._QUOTED.match(text)) else -1)
+                if end >= 0:
+                    break
+                if i + k >= len(self.lines):
+                    self._error("unterminated flow collection or quoted scalar")
+                k = 2 * k or 1
+            self.i = i + text.count("\n", 0, end)
+            tail = text[end:].split("\n", 1)[0].strip(" \t")
+            if tail[:1] not in {"", "#"}:
+                self._error(f"unexpected {tail!r}")
+            return self._flow(text[:end]) if flow else self._unquote(text[:end])
+        if rest[0] in "|>":
+            return self._block_scalar(rest, n)
+        if rest[0] in "&*!":
+            self._error("anchors, aliases and tags are not supported")
+        s, j = self._COMMENT.split(rest, maxsplit=1)[0].rstrip(" \t") if "#" in rest else rest, self.i
+        while (m := self._peek())[0] > n:  # multi-line plain scalar: a line break folds to a space, n blank lines to n
+            s += ("\n" * (self.i - j) or " ") + (
+                self._COMMENT.split(m[1], maxsplit=1)[0].rstrip(" \t") if "#" in m[1] else m[1]
+            )
+            self.i = j = self.i + 1
+        if ": " in s or s.endswith(":"):
+            self._error(f"mapping inside plain scalar {s!r}")
+        return self._scalar(s)
+
+    def _block_scalar(self, header, n):
+        """Read a literal '|' or folded '>' block scalar with optional chomping and indentation indicators."""
+        h = header.split("#", 1)[0].strip(" \t")
+        if not re.fullmatch(r"[|>]([1-9]?[+-]?|[+-][1-9])", h):
+            self._error(f"invalid block scalar header {header!r}, quote values that start with '|' or '>'")
+        lines, ind = [], n + int(d[0]) if (d := re.search(r"\d", h)) else None  # an indicator fixes the content indent
+        while self.i < len(self.lines):
+            raw = self.lines[self.i]
+            if raw.strip(" \t"):
+                m = len(raw) - len(raw.lstrip(" "))
+                if m <= n or (ind is not None and m < ind):  # a less-indented line ends the scalar
+                    break
+                ind = m if ind is None else ind
+            lines.append(raw)
+            self.i += 1
+        ind = max(map(len, lines), default=0) if ind is None else ind  # no content line: every line is empty
+        lines, trailing = [x[ind:] for x in lines], -(self.i == len(self.lines))  # '' after the final break is no line
+        while lines and not lines[-1]:  # only empty lines chomp, spaces past the indent are content
+            lines.pop()
+            trailing += 1
+        text = "\n".join(lines)
+        if h[0] == ">":  # fold breaks between unindented text lines: one to a space, n + 1 to n newlines
+            text = re.sub(r"(?m)^([^ \n].*)\n(\n*)(?=[^ \n])", lambda m: m[1] + (m[2] or " "), text)
+        if "-" in h or trailing < 0:  # strip, or no final line break at end of file
+            return text
+        return (text + "\n" if text else "") + "\n" * (trailing if "+" in h else 0)
+
+    @classmethod
+    def _flow_end(cls, text):
+        """Return the index just past the flow collection that opens text, or -1 if it continues on the next line."""
+        depth = 0
+        for m in cls._FLOW.finditer(text):
+            depth += (m[2] in {"[", "{"}) - (m[2] in {"]", "}"})
+            if not depth:
+                return m.end()
+        return -1
+
+    def _flow(self, text):
+        """Parse a complete flow collection."""
+        toks = [(m[1], m[2], m[4]) for m in self._FLOW.finditer(text) if not m[3]]
+        pos = 0
+
+        def node():
+            """Parse the flow node at the current token."""
+            nonlocal pos
+            q, ind, plain = toks[pos]
+            pos += 1
+            if plain and plain[0] in "&*!":
+                self._error("anchors, aliases and tags are not supported")
+            if q or plain:
+                return self._unquote(q) if q else self._scalar(re.sub(self._FOLD, self._fold, plain.rstrip(" \t\n")))
+            if ind not in {"[", "{"}:
+                self._error(f"unexpected {ind!r} in {text!r}")
+            close, out = ("]", []) if ind == "[" else ("}", {})
+            while toks[pos][1] != close:
+                k = node()
+                if ind == "[":
+                    out.append(k)
+                elif toks[pos][1] == ":":
+                    pos += 1
+                    out[k] = None if toks[pos][1] in {",", "}"} else node()
+                else:
+                    out[k] = None
+                if toks[pos][1] == ",":
+                    pos += 1
+                elif toks[pos][1] != close:
+                    self._error(f"expected ',' or '{close}' in {text!r}")
+            pos += 1
+            return out
+
+        try:
+            return node()
+        except IndexError:
+            self._error(f"unterminated flow collection {text!r}")
 
 
 # Default configuration
-DEFAULT_CFG_DICT = yaml_load(DEFAULT_CFG_PATH)
-DEFAULT_SOL_DICT = yaml_load(DEFAULT_SOL_CFG_PATH)  # Ultralytics solutions configuration
-for k, v in DEFAULT_CFG_DICT.items():
-    if isinstance(v, str) and v.lower() == "none":
-        DEFAULT_CFG_DICT[k] = None
+DEFAULT_CFG_DICT = YAML.load(DEFAULT_CFG_PATH)
 DEFAULT_CFG_KEYS = DEFAULT_CFG_DICT.keys()
 DEFAULT_CFG = IterableSimpleNamespace(**DEFAULT_CFG_DICT)
 
 
 def read_device_model() -> str:
-    """
-    Reads the device model information from the system and caches it for quick access. Used by is_jetson() and
-    is_raspberrypi().
+    """Read the device model information from the system.
 
     Returns:
-        (str): Model file contents if read successfully or empty string otherwise.
+        (str): Platform release string in lowercase, used to identify device models like Jetson or Raspberry Pi.
     """
-    try:
-        with open("/proc/device-tree/model") as f:
-            return f.read()
-    except Exception:
-        return ""
+    return platform.release().lower()
 
 
 def is_ubuntu() -> bool:
-    """
-    Check if the OS is Ubuntu.
+    """Check if the OS is Ubuntu.
 
     Returns:
         (bool): True if OS is Ubuntu, False otherwise.
@@ -546,9 +998,34 @@ def is_ubuntu() -> bool:
         return False
 
 
-def is_colab():
+def is_debian(codenames: list[str] | str | None = None) -> list[bool] | bool:
+    """Check if the OS is Debian.
+
+    Args:
+        codenames (list[str] | None | str): Specific Debian codename to check for (e.g., 'buster', 'bullseye'). If None,
+            only checks for Debian.
+
+    Returns:
+        (list[bool] | bool): List of booleans indicating if OS matches each Debian codename, or a single boolean if no
+            codenames provided.
     """
-    Check if the current script is running inside a Google Colab notebook.
+    try:
+        with open("/etc/os-release") as f:
+            content = f.read()
+            if codenames is None:
+                return "ID=debian" in content
+            if isinstance(codenames, str):
+                codenames = [codenames]
+            return [
+                f"VERSION_CODENAME={codename}" in content if codename else "ID=debian" in content
+                for codename in codenames
+            ]
+    except FileNotFoundError:
+        return [False] * len(codenames) if codenames else False
+
+
+def is_colab():
+    """Check if the current script is running inside a Google Colab notebook.
 
     Returns:
         (bool): True if running inside a Colab notebook, False otherwise.
@@ -557,8 +1034,7 @@ def is_colab():
 
 
 def is_kaggle():
-    """
-    Check if the current script is running inside a Kaggle kernel.
+    """Check if the current script is running inside a Kaggle kernel.
 
     Returns:
         (bool): True if running inside a Kaggle kernel, False otherwise.
@@ -567,81 +1043,108 @@ def is_kaggle():
 
 
 def is_jupyter():
-    """
-    Check if the current script is running inside a Jupyter Notebook.
+    """Check if the current script is running inside a Jupyter Notebook.
 
     Returns:
         (bool): True if running inside a Jupyter Notebook, False otherwise.
 
-    Note:
+    Notes:
         - Only works on Colab and Kaggle, other environments like Jupyterlab and Paperspace are not reliably detectable.
         - "get_ipython" in globals() method suffers false positives when IPython package installed manually.
     """
     return IS_COLAB or IS_KAGGLE
 
 
-def is_docker() -> bool:
+def is_runpod():
+    """Check if the current script is running inside a RunPod container.
+
+    Returns:
+        (bool): True if running in RunPod, False otherwise.
     """
-    Determine if the script is running inside a Docker container.
+    return "RUNPOD_POD_ID" in os.environ
+
+
+def is_docker() -> bool:
+    """Determine if the script is running inside a Docker container.
 
     Returns:
         (bool): True if the script is running inside a Docker container, False otherwise.
     """
     try:
-        with open("/proc/self/cgroup") as f:
-            return "docker" in f.read()
+        return os.path.exists("/.dockerenv")
     except Exception:
         return False
 
 
 def is_raspberrypi() -> bool:
-    """
-    Determines if the Python environment is running on a Raspberry Pi by checking the device model information.
+    """Determine if the Python environment is running on a Raspberry Pi.
 
     Returns:
         (bool): True if running on a Raspberry Pi, False otherwise.
     """
-    return "Raspberry Pi" in PROC_DEVICE_MODEL
+    return "rpi" in DEVICE_MODEL
 
 
-def is_jetson() -> bool:
-    """
-    Determines if the Python environment is running on a Jetson Nano or Jetson Orin device by checking the device model
-    information.
+@lru_cache(maxsize=3)
+def is_jetson(jetpack=None) -> bool:
+    """Determine if the Python environment is running on an NVIDIA Jetson device.
+
+    Args:
+        jetpack (int | None): If specified, check for specific JetPack version (4, 5, 6, 7).
 
     Returns:
-        (bool): True if running on a Jetson Nano or Jetson Orin, False otherwise.
+        (bool): True if running on an NVIDIA Jetson device, False otherwise.
     """
-    return "NVIDIA" in PROC_DEVICE_MODEL  # i.e. "NVIDIA Jetson Nano" or "NVIDIA Orin NX"
+    jetson = "tegra" in DEVICE_MODEL
+    if jetson and jetpack:
+        try:
+            content = Path("/etc/nv_tegra_release").read_text()
+            version_map = {4: ("R32",), 5: ("R35",), 6: ("R36",), 7: ("R38", "R39")}  # JetPack to L4T major versions
+            return any(r in content for r in version_map.get(jetpack, ()))
+        except Exception:
+            return False
+    return jetson
+
+
+def is_dgx() -> bool:
+    """Check if the current script is running inside a DGX (NVIDIA Data Center GPU), DGX-Ready or DGX Spark system.
+
+    Returns:
+        (bool): True if running in a DGX or DGX-Ready or DGX Spark system, False otherwise.
+    """
+    try:
+        with open("/etc/dgx-release") as f:
+            return "DGX" in f.read()
+    except FileNotFoundError:
+        return False
 
 
 def is_online() -> bool:
-    """
-    Check internet connectivity by attempting to connect to a known online host.
+    """Fast online check using DNS (v4/v6) resolution (Cloudflare + Google).
 
     Returns:
         (bool): True if connection is successful, False otherwise.
     """
-    try:
-        assert str(os.getenv("YOLO_OFFLINE", "")).lower() != "true"  # check if ENV var YOLO_OFFLINE="True"
-        import socket
-
-        for dns in ("1.1.1.1", "8.8.8.8"):  # check Cloudflare and Google DNS
-            socket.create_connection(address=(dns, 80), timeout=2.0).close()
-            return True
-    except Exception:
+    if env_bool("YOLO_OFFLINE"):
         return False
+
+    for host in ("one.one.one.one", "dns.google"):
+        try:
+            socket.getaddrinfo(host, 0, socket.AF_UNSPEC, 0, 0, socket.AI_ADDRCONFIG)
+            return True
+        except OSError:
+            continue
+    return False
 
 
 def is_pip_package(filepath: str = __name__) -> bool:
-    """
-    Determines if the file at the given filepath is part of a pip package.
+    """Determine if the given module is importable from an installed package.
 
     Args:
-        filepath (str): The filepath to check.
+        filepath (str): The dotted module name to check, e.g. 'ultralytics.utils'.
 
     Returns:
-        (bool): True if the file is part of a pip package, False otherwise.
+        (bool): True if the module spec is found and has an origin, False otherwise.
     """
     import importlib.util
 
@@ -652,22 +1155,20 @@ def is_pip_package(filepath: str = __name__) -> bool:
     return spec is not None and spec.origin is not None
 
 
-def is_dir_writeable(dir_path: Union[str, Path]) -> bool:
-    """
-    Check if a directory is writeable.
+def is_dir_writeable(dir_path: str | Path) -> bool:
+    """Check if a directory is writable.
 
     Args:
         dir_path (str | Path): The path to the directory.
 
     Returns:
-        (bool): True if the directory is writeable, False otherwise.
+        (bool): True if the directory is writable, False otherwise.
     """
     return os.access(str(dir_path), os.W_OK)
 
 
 def is_pytest_running():
-    """
-    Determines whether pytest is currently running or not.
+    """Determine whether pytest is currently running or not.
 
     Returns:
         (bool): True if pytest is running, False otherwise.
@@ -676,8 +1177,7 @@ def is_pytest_running():
 
 
 def is_github_action_running() -> bool:
-    """
-    Determine if the current environment is a GitHub Actions runner.
+    """Determine if the current environment is a GitHub Actions runner.
 
     Returns:
         (bool): True if the current environment is a GitHub Actions runner, False otherwise.
@@ -685,63 +1185,8 @@ def is_github_action_running() -> bool:
     return "GITHUB_ACTIONS" in os.environ and "GITHUB_WORKFLOW" in os.environ and "RUNNER_OS" in os.environ
 
 
-def get_git_dir():
-    """
-    Determines whether the current file is part of a git repository and if so, returns the repository root directory. If
-    the current file is not part of a git repository, returns None.
-
-    Returns:
-        (Path | None): Git root directory if found or None if not found.
-    """
-    for d in Path(__file__).parents:
-        if (d / ".git").is_dir():
-            return d
-
-
-def is_git_dir():
-    """
-    Determines whether the current file is part of a git repository. If the current file is not part of a git
-    repository, returns None.
-
-    Returns:
-        (bool): True if current file is part of a git repository.
-    """
-    return GIT_DIR is not None
-
-
-def get_git_origin_url():
-    """
-    Retrieves the origin URL of a git repository.
-
-    Returns:
-        (str | None): The origin URL of the git repository or None if not git directory.
-    """
-    if IS_GIT_DIR:
-        try:
-            origin = subprocess.check_output(["git", "config", "--get", "remote.origin.url"])
-            return origin.decode().strip()
-        except subprocess.CalledProcessError:
-            return None
-
-
-def get_git_branch():
-    """
-    Returns the current git branch name. If not in a git repository, returns None.
-
-    Returns:
-        (str | None): The current git branch name or None if not a git directory.
-    """
-    if IS_GIT_DIR:
-        try:
-            origin = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-            return origin.decode().strip()
-        except subprocess.CalledProcessError:
-            return None
-
-
 def get_default_args(func):
-    """
-    Returns a dictionary of default arguments for a function.
+    """Return a dictionary of default arguments for a function.
 
     Args:
         func (callable): The function to inspect.
@@ -754,11 +1199,10 @@ def get_default_args(func):
 
 
 def get_ubuntu_version():
-    """
-    Retrieve the Ubuntu version if the OS is Ubuntu.
+    """Retrieve the Ubuntu version if the OS is Ubuntu.
 
     Returns:
-        (str): Ubuntu version or None if not an Ubuntu OS.
+        (str | None): Ubuntu version, e.g. '22.04', or None if not an Ubuntu OS.
     """
     if is_ubuntu():
         try:
@@ -769,40 +1213,48 @@ def get_ubuntu_version():
 
 
 def get_user_config_dir(sub_dir="Ultralytics"):
-    """
-    Return the appropriate config directory based on the environment operating system.
+    """Return a writable config dir, preferring YOLO_CONFIG_DIR and being OS-aware.
 
     Args:
         sub_dir (str): The name of the subdirectory to create.
 
     Returns:
         (Path): The path to the user config directory.
+
+    Raises:
+        ValueError: If the operating system is not supported and YOLO_CONFIG_DIR is not set.
     """
-    if WINDOWS:
-        path = Path.home() / "AppData" / "Roaming" / sub_dir
-    elif MACOS:  # macOS
-        path = Path.home() / "Library" / "Application Support" / sub_dir
+    if env_dir := os.getenv("YOLO_CONFIG_DIR"):
+        p = Path(env_dir).expanduser() / sub_dir
     elif LINUX:
-        path = Path.home() / ".config" / sub_dir
+        p = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config")) / sub_dir
+    elif WINDOWS:
+        p = Path.home() / "AppData" / "Roaming" / sub_dir
+    elif MACOS:
+        p = Path.home() / "Library" / "Application Support" / sub_dir
     else:
         raise ValueError(f"Unsupported operating system: {platform.system()}")
 
-    # GCP and AWS lambda fix, only /tmp is writeable
-    if not is_dir_writeable(path.parent):
-        LOGGER.warning(
-            f"WARNING ⚠️ user config directory '{path}' is not writeable, defaulting to '/tmp' or CWD."
-            "Alternatively you can define a YOLO_CONFIG_DIR environment variable for this path."
-        )
-        path = Path("/tmp") / sub_dir if is_dir_writeable("/tmp") else Path().cwd() / sub_dir
+    with contextlib.suppress(OSError):  # create if possible
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
-    # Create the subdirectory if it does not exist
-    path.mkdir(parents=True, exist_ok=True)
-
-    return path
+    # Fallback for Docker, GCP/AWS functions where only /tmp is writable, private to the current user
+    alt = Path(tempfile.gettempdir()) / (sub_dir if WINDOWS else f"{sub_dir}-{os.getuid()}")
+    try:
+        alt.mkdir(mode=0o777 if WINDOWS else 0o700)  # a Windows 0o700 DACL locks out non-elevated runs
+    except OSError:
+        with contextlib.suppress(OSError):  # own private dir only, never a symlink; Windows %TEMP% is per-user
+            info = alt.lstat()
+            if stat.S_ISDIR(info.st_mode) and (WINDOWS or (info.st_uid, info.st_mode & 0o777) == (os.getuid(), 0o700)):
+                return alt
+        alt = Path(tempfile.mkdtemp(prefix=f"{sub_dir}-"))  # otherwise a new private dir for this process
+    LOGGER.warning(f"user config directory '{p}' is not writable, using '{alt}'. Set YOLO_CONFIG_DIR to override.")
+    return alt
 
 
 # Define constants (required below)
-PROC_DEVICE_MODEL = read_device_model()  # is_jetson() and is_raspberrypi() depend on this constant
+DEVICE_MODEL = read_device_model()  # is_jetson() and is_raspberrypi() depend on this constant
 ONLINE = is_online()
 IS_COLAB = is_colab()
 IS_KAGGLE = is_kaggle()
@@ -811,16 +1263,15 @@ IS_JETSON = is_jetson()
 IS_JUPYTER = is_jupyter()
 IS_PIP_PACKAGE = is_pip_package()
 IS_RASPBERRYPI = is_raspberrypi()
-GIT_DIR = get_git_dir()
-IS_GIT_DIR = is_git_dir()
-USER_CONFIG_DIR = Path(os.getenv("YOLO_CONFIG_DIR") or get_user_config_dir())  # Ultralytics settings dir
+IS_DEBIAN, IS_DEBIAN_BOOKWORM, IS_DEBIAN_TRIXIE = is_debian([None, "bookworm", "trixie"])
+IS_UBUNTU = is_ubuntu()
+GIT = GitRepo()
+USER_CONFIG_DIR = get_user_config_dir()  # Ultralytics settings dir
 SETTINGS_FILE = USER_CONFIG_DIR / "settings.json"
 
 
 def colorstr(*input):
-    r"""
-    Colors a string based on the provided color and style arguments. Utilizes ANSI escape codes.
-    See https://en.wikipedia.org/wiki/ANSI_escape_code for more details.
+    r"""Color a string based on the provided color and style arguments using ANSI escape codes.
 
     This function can be called in two ways:
         - colorstr('color', 'style', 'your string')
@@ -829,21 +1280,25 @@ def colorstr(*input):
     In the second form, 'blue' and 'bold' will be applied by default.
 
     Args:
-        *input (str | Path): A sequence of strings where the first n-1 strings are color and style arguments,
-                      and the last string is the one to be colored.
-
-    Supported Colors and Styles:
-        Basic Colors: 'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'
-        Bright Colors: 'bright_black', 'bright_red', 'bright_green', 'bright_yellow',
-                       'bright_blue', 'bright_magenta', 'bright_cyan', 'bright_white'
-        Misc: 'end', 'bold', 'underline'
+        *input (str | Path): A sequence of strings where the first n-1 strings are color and style arguments, and the
+            last string is the one to be colored.
 
     Returns:
         (str): The input string wrapped with ANSI escape codes for the specified color and style.
 
     Examples:
         >>> colorstr("blue", "bold", "hello world")
-        >>> "\033[34m\033[1mhello world\033[0m"
+        '\x1b[34m\x1b[1mhello world\x1b[0m'
+
+    Notes:
+        Supported Colors and Styles:
+        - Basic Colors: 'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'
+        - Bright Colors: 'bright_black', 'bright_red', 'bright_green', 'bright_yellow',
+                       'bright_blue', 'bright_magenta', 'bright_cyan', 'bright_white'
+        - Misc: 'end', 'bold', 'underline'
+
+    References:
+        https://en.wikipedia.org/wiki/ANSI_escape_code
     """
     *args, string = input if len(input) > 1 else ("blue", "bold", input[0])  # color arguments, string
     colors = {
@@ -871,8 +1326,7 @@ def colorstr(*input):
 
 
 def remove_colorstr(input_string):
-    """
-    Removes ANSI escape codes from a string, effectively un-coloring it.
+    """Remove ANSI escape codes from a string, effectively un-coloring it.
 
     Args:
         input_string (str): The string to remove color and style from.
@@ -882,27 +1336,33 @@ def remove_colorstr(input_string):
 
     Examples:
         >>> remove_colorstr(colorstr("blue", "bold", "hello world"))
-        >>> "hello world"
+        'hello world'
     """
     ansi_escape = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
     return ansi_escape.sub("", input_string)
 
 
 class TryExcept(contextlib.ContextDecorator):
-    """
-    Ultralytics TryExcept class. Use as @TryExcept() decorator or 'with TryExcept():' context manager.
+    """Ultralytics TryExcept class for handling exceptions gracefully.
+
+    This class can be used as a decorator or context manager to catch exceptions and optionally print warning messages.
+    It allows code to continue execution even when exceptions occur, which is useful for non-critical operations.
+
+    Attributes:
+        msg (str): Optional message to display when an exception occurs.
+        verbose (bool): Whether to print the exception message.
 
     Examples:
         As a decorator:
         >>> @TryExcept(msg="Error occurred in func", verbose=True)
-        >>> def func():
-        >>> # Function logic here
-        >>>     pass
+        ... def func():
+        ...     # Function logic here
+        ...     pass
 
         As a context manager:
         >>> with TryExcept(msg="Error occurred in block", verbose=True):
-        >>> # Code block here
-        >>>     pass
+        ...     # Code block here
+        ...     pass
     """
 
     def __init__(self, msg="", verbose=True):
@@ -911,67 +1371,91 @@ class TryExcept(contextlib.ContextDecorator):
         self.verbose = verbose
 
     def __enter__(self):
-        """Executes when entering TryExcept context, initializes instance."""
-        pass
+        """Execute when entering TryExcept context, initialize instance."""
 
     def __exit__(self, exc_type, value, traceback):
-        """Defines behavior when exiting a 'with' block, prints error message if necessary."""
+        """Define behavior when exiting a 'with' block, print error message if necessary."""
         if self.verbose and value:
-            print(emojis(f"{self.msg}{': ' if self.msg else ''}{value}"))
+            LOGGER.warning(f"{self.msg}{': ' if self.msg else ''}{value}")
         return True
 
 
 class Retry(contextlib.ContextDecorator):
-    """
-    Retry class for function execution with exponential backoff.
+    """Retry class for function execution with exponential backoff.
 
-    Can be used as a decorator to retry a function on exceptions, up to a specified number of times with an
-    exponentially increasing delay between retries.
+    This decorator can be used to retry a function on exceptions, up to a specified number of times with an
+    exponentially increasing delay between retries. It's useful for handling transient failures in network operations or
+    other unreliable processes.
+
+    Attributes:
+        times (int): Maximum number of attempts, including the first call.
+        delay (int): Base delay in seconds; the wait after the n-th failed attempt is `delay * 2**n`.
+        verbose (bool): Whether to log a warning for each failed attempt.
 
     Examples:
         Example usage as a decorator:
         >>> @Retry(times=3, delay=2)
-        >>> def test_func():
-        >>> # Replace with function logic that may raise exceptions
-        >>>     return True
+        ... def test_func():
+        ...     # Replace with function logic that may raise exceptions
+        ...     return True
     """
 
-    def __init__(self, times=3, delay=2):
+    def __init__(self, times=3, delay=2, verbose=True):
         """Initialize Retry class with specified number of retries and delay."""
         self.times = times
         self.delay = delay
+        self.verbose = verbose  # False when the caller's own logging would feed back into its retries
         self._attempts = 0
 
     def __call__(self, func):
         """Decorator implementation for Retry with exponential backoff."""
 
         def wrapped_func(*args, **kwargs):
-            """Applies retries to the decorated function or method."""
+            """Apply retries to the decorated function or method."""
             self._attempts = 0
             while self._attempts < self.times:
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
                     self._attempts += 1
-                    print(f"Retry {self._attempts}/{self.times} failed: {e}")
+                    if self.verbose:
+                        LOGGER.warning(f"Retry {self._attempts}/{self.times} failed: {e}")
                     if self._attempts >= self.times:
-                        raise e
+                        raise
                     time.sleep(self.delay * (2**self._attempts))  # exponential backoff delay
 
         return wrapped_func
 
 
 def threaded(func):
-    """
-    Multi-threads a target function by default and returns the thread or function result.
+    """Multi-thread a target function by default and return the thread or function result.
 
-    Use as @threaded decorator. The function runs in a separate thread unless 'threaded=False' is passed.
+    This decorator provides flexible execution of the target function, either in a separate thread or synchronously. By
+    default, the function runs in a thread, but this can be controlled via the 'threaded=False' keyword argument which
+    is removed from kwargs before calling the function.
+
+    Args:
+        func (callable): The function to be potentially executed in a separate thread.
+
+    Returns:
+        (callable): A wrapper function that either returns a thread or the direct function result. The thread is
+            non-daemon so interpreter shutdown joins it before module teardown, avoiding teardown races.
+
+    Examples:
+        >>> @threaded
+        ... def process_data(data):
+        ...     return data
+        >>>
+        >>> thread = process_data(my_data)  # Runs in background thread
+        >>> result = process_data(my_data, threaded=False)  # Runs synchronously, returns function result
     """
 
     def wrapper(*args, **kwargs):
-        """Multi-threads a given function based on 'threaded' kwarg and returns the thread or function result."""
+        """Multi-thread a given function based on 'threaded' kwarg and return the thread or function result."""
         if kwargs.pop("threaded", True):  # run in thread
-            thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
+            # Non-daemon so interpreter shutdown joins the thread before module teardown; a daemon thread still
+            # running at exit can be killed mid-C-call, aborting the process (e.g. 'FATAL: exception not rethrown').
+            thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=False)
             thread.start()
             return thread
         else:
@@ -981,24 +1465,20 @@ def threaded(func):
 
 
 def set_sentry():
-    """
-    Initialize the Sentry SDK for error tracking and reporting. Only used if sentry_sdk package is installed and
-    sync=True in settings. Run 'yolo settings' to see and update settings.
+    """Initialize the Sentry SDK for error tracking and reporting.
+
+    Only used if sentry_sdk package is installed and sync=True in settings. Run 'yolo settings' to see and update
+    settings.
 
     Conditions required to send errors (ALL conditions must be met or no errors will be reported):
         - sentry_sdk package is installed
         - sync=True in YOLO settings
-        - pytest is not running
+        - pytest and GitHub Actions are not running
         - running in a pip package installation
         - running in a non-git directory
         - running with rank -1 or 0
         - online environment
         - CLI used to run package (checked with 'yolo' as the name of the main CLI command)
-
-    The function also configures Sentry SDK to ignore KeyboardInterrupt and FileNotFoundError exceptions and to exclude
-    events with 'out of memory' in their exception message.
-
-    Additionally, the function sets custom tags and user information for Sentry events.
     """
     if (
         not SETTINGS["sync"]
@@ -1007,35 +1487,35 @@ def set_sentry():
         or TESTS_RUNNING
         or not ONLINE
         or not IS_PIP_PACKAGE
-        or IS_GIT_DIR
+        or GIT.is_repo
     ):
         return
     # If sentry_sdk package is not installed then return and do not use Sentry
     try:
-        import sentry_sdk  # noqa
+        import sentry_sdk
     except ImportError:
         return
 
     def before_send(event, hint):
-        """
-        Modify the event before sending it to Sentry based on specific exception types and messages.
+        """Modify the event before sending it to Sentry based on specific exception types and messages.
 
         Args:
             event (dict): The event dictionary containing information about the error.
             hint (dict): A dictionary containing additional information about the error.
 
         Returns:
-            dict: The modified event or None if the event should not be sent to Sentry.
+            (dict | None): The modified event or None if the event should not be sent to Sentry.
         """
         if "exc_info" in hint:
             exc_type, exc_value, _ = hint["exc_info"]
             if exc_type in {KeyboardInterrupt, FileNotFoundError} or "out of memory" in str(exc_value):
                 return None  # do not send event
 
+        event.get("extra", {}).pop("sys.argv", None)
         event["tags"] = {
             "sys_argv": ARGV[0],
             "sys_argv_name": Path(ARGV[0]).name,
-            "install": "git" if IS_GIT_DIR else "pip" if IS_PIP_PACKAGE else "other",
+            "install": "git" if GIT.is_repo else "pip" if IS_PIP_PACKAGE else "other",
             "os": ENVIRONMENT,
         }
         return event
@@ -1044,33 +1524,33 @@ def set_sentry():
         dsn="https://888e5a0778212e1d0314c37d4b9aae5d@o4504521589325824.ingest.us.sentry.io/4504521592406016",
         debug=False,
         auto_enabling_integrations=False,
+        include_local_variables=False,
         traces_sample_rate=1.0,
         release=__version__,
-        environment="production",  # 'dev' or 'production'
+        environment="runpod" if is_runpod() else "production",
         before_send=before_send,
-        ignore_errors=[KeyboardInterrupt, FileNotFoundError],
+        ignore_errors=[KeyboardInterrupt, FileNotFoundError, "OutOfMemoryError"],  # torch OOM by name, no torch import
     )
     sentry_sdk.set_user({"id": SETTINGS["uuid"]})  # SHA-256 anonymized UUID hash
 
 
 class JSONDict(dict):
-    """
-    A dictionary-like class that provides JSON persistence for its contents.
+    """A dictionary-like class that provides JSON persistence for its contents.
 
     This class extends the built-in dictionary to automatically save its contents to a JSON file whenever they are
-    modified. It ensures thread-safe operations using a lock.
+    modified. It ensures thread-safe operations using a lock and handles JSON serialization of Path objects.
 
     Attributes:
         file_path (Path): The path to the JSON file used for persistence.
         lock (threading.Lock): A lock object to ensure thread-safe operations.
 
     Methods:
-        _load: Loads the data from the JSON file into the dictionary.
-        _save: Saves the current state of the dictionary to the JSON file.
-        __setitem__: Stores a key-value pair and persists it to disk.
-        __delitem__: Removes an item and updates the persistent storage.
-        update: Updates the dictionary and persists changes.
-        clear: Clears all entries and updates the persistent storage.
+        _load: Load the data from the JSON file into the dictionary.
+        _save: Save the current state of the dictionary to the JSON file.
+        __setitem__: Store a key-value pair and persist it to disk.
+        __delitem__: Remove an item and update the persistent storage.
+        update: Update the dictionary and persist changes.
+        clear: Clear all entries and update the persistent storage.
 
     Examples:
         >>> json_dict = JSONDict("data.json")
@@ -1082,7 +1562,7 @@ class JSONDict(dict):
         >>> json_dict.clear()
     """
 
-    def __init__(self, file_path: Union[str, Path] = "data.json"):
+    def __init__(self, file_path: str | Path = "data.json"):
         """Initialize a JSONDict object with a specified file path for JSON persistence."""
         super().__init__()
         self.file_path = Path(file_path)
@@ -1094,20 +1574,21 @@ class JSONDict(dict):
         try:
             if self.file_path.exists():
                 with open(self.file_path) as f:
-                    self.update(json.load(f))
+                    # Use the base dict update to avoid persisting during reads
+                    super().update(json.load(f))
         except json.JSONDecodeError:
-            print(f"Error decoding JSON from {self.file_path}. Starting with an empty dictionary.")
+            LOGGER.warning(f"Error decoding JSON from {self.file_path}. Starting with an empty dictionary.")
         except Exception as e:
-            print(f"Error reading from {self.file_path}: {e}")
+            LOGGER.error(f"Error reading from {self.file_path}: {e}")
 
     def _save(self):
         """Save the current state of the dictionary to the JSON file."""
         try:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.file_path, "w") as f:
+            with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump(dict(self), f, indent=2, default=self._json_default)
         except Exception as e:
-            print(f"Error writing to {self.file_path}: {e}")
+            LOGGER.error(f"Error writing to {self.file_path}: {e}")
 
     @staticmethod
     def _json_default(obj):
@@ -1130,7 +1611,8 @@ class JSONDict(dict):
 
     def __str__(self):
         """Return a pretty-printed JSON string representation of the dictionary."""
-        return f'JSONDict("{self.file_path}"):\n{json.dumps(dict(self), indent=2, ensure_ascii=False, default=self._json_default)}'
+        contents = json.dumps(dict(self), indent=2, ensure_ascii=False, default=self._json_default)
+        return f'JSONDict("{self.file_path}"):\n{contents}'
 
     def update(self, *args, **kwargs):
         """Update the dictionary and persist changes."""
@@ -1146,22 +1628,22 @@ class JSONDict(dict):
 
 
 class SettingsManager(JSONDict):
-    """
-    SettingsManager class for managing and persisting Ultralytics settings.
+    """SettingsManager class for managing and persisting Ultralytics settings.
 
     This class extends JSONDict to provide JSON persistence for settings, ensuring thread-safe operations and default
-    values. It validates settings on initialization and provides methods to update or reset settings.
+    values. It validates settings on initialization and provides methods to update or reset settings. The settings
+    include directories for datasets, weights, and runs, as well as various integration flags.
 
     Attributes:
         file (Path): The path to the JSON file used for persistence.
         version (str): The version of the settings schema.
-        defaults (Dict): A dictionary containing default settings.
+        defaults (dict): A dictionary containing default settings.
         help_msg (str): A help message for users on how to view and update settings.
 
     Methods:
-        _validate_settings: Validates the current settings and resets if necessary.
-        update: Updates settings, validating keys and types.
-        reset: Resets the settings to default and saves them.
+        _validate_settings: Validate the current settings and reset if necessary.
+        update: Update settings, validating keys and types.
+        reset: Reset the settings to default and save them.
 
     Examples:
         Initialize and update settings:
@@ -1171,14 +1653,15 @@ class SettingsManager(JSONDict):
         /new/runs/dir
     """
 
-    def __init__(self, file=SETTINGS_FILE, version="0.0.6"):
-        """Initializes the SettingsManager with default settings and loads user settings."""
+    def __init__(self, file=SETTINGS_FILE, version="0.0.8"):
+        """Initialize the SettingsManager with default settings and load user settings."""
         import hashlib
+        import uuid
 
         from ultralytics.utils.torch_utils import torch_distributed_zero_first
 
-        root = GIT_DIR or Path()
-        datasets_root = (root.parent if GIT_DIR and is_dir_writeable(root.parent) else root).resolve()
+        root = GIT.root or Path()
+        datasets_root = (root.parent if GIT.root and is_dir_writeable(root.parent) else root).resolve()
 
         self.file = Path(file)
         self.version = version
@@ -1187,29 +1670,28 @@ class SettingsManager(JSONDict):
             "datasets_dir": str(datasets_root / "datasets"),  # Datasets directory
             "weights_dir": str(root / "weights"),  # Model weights directory
             "runs_dir": str(root / "runs"),  # Experiment runs directory
-            "uuid": hashlib.sha256(str(uuid.getnode()).encode()).hexdigest(),  # SHA-256 anonymized UUID hash
+            "uuid": hashlib.sha256(f"{uuid.getnode()}{platform.node()}".encode()).hexdigest(),  # MAC + host (Colab)
             "sync": True,  # Enable synchronization
             "api_key": "",  # Ultralytics API Key
             "openai_api_key": "",  # OpenAI API Key
             "clearml": True,  # ClearML integration
             "comet": True,  # Comet integration
             "dvc": True,  # DVC integration
-            "hub": True,  # Ultralytics HUB integration
             "mlflow": True,  # MLflow integration
-            "neptune": True,  # Neptune integration
             "raytune": True,  # Ray Tune integration
-            "tensorboard": True,  # TensorBoard logging
+            "tensorboard": False,  # TensorBoard logging
             "wandb": False,  # Weights & Biases logging
-            "vscode_msg": True,  # VSCode messaging
+            "vscode_msg": True,  # VSCode message
+            "openvino_msg": True,  # OpenVINO export on Intel CPU message
         }
 
         self.help_msg = (
             f"\nView Ultralytics Settings with 'yolo settings' or at '{self.file}'"
             "\nUpdate Settings with 'yolo settings key=value', i.e. 'yolo settings runs_dir=path/to/dir'. "
-            "For help see https://docs.ultralytics.com/quickstart/#ultralytics-settings."
+            "For help see https://docs.ultralytics.com/usage/settings"
         )
 
-        with torch_distributed_zero_first(RANK):
+        with torch_distributed_zero_first(LOCAL_RANK):
             super().__init__(self.file)
 
             if not self.file.exists() or not self:  # Check if file doesn't exist or is empty
@@ -1219,59 +1701,84 @@ class SettingsManager(JSONDict):
             self._validate_settings()
 
     def _validate_settings(self):
-        """Validate the current settings and reset if necessary."""
-        correct_keys = set(self.keys()) == set(self.defaults.keys())
+        """Validate settings and migrate valid values to the current schema."""
+        correct_keys = frozenset(self.keys()) == frozenset(self.defaults.keys())
         correct_types = all(isinstance(self.get(k), type(v)) for k, v in self.defaults.items())
         correct_version = self.get("settings_version", "") == self.version
 
         if not (correct_keys and correct_types and correct_version):
             LOGGER.warning(
-                "WARNING ⚠️ Ultralytics settings reset to default values. This may be due to a possible problem "
-                f"with your settings or a recent ultralytics package update. {self.help_msg}"
+                "Ultralytics settings updated to the latest schema. Existing values were preserved where possible. "
+                f"{self.help_msg}"
             )
-            self.reset()
+            valid = {k: v for k, v in self.items() if k in self.defaults and isinstance(v, type(self.defaults[k]))}
+            if not re.fullmatch(r"ul_[0-9a-f]{40}", valid.get("api_key", "")):
+                if valid.get("api_key"):
+                    LOGGER.warning(
+                        f"Legacy API key removed. Get a Platform API key from {PLATFORM_URL}/settings?tab=api-keys "
+                        "and run 'yolo login API_KEY'."
+                    )
+                valid["api_key"] = ""  # discard legacy keys, which cannot authenticate with Platform
+            valid["settings_version"] = self.version
+            self.clear()
+            self.update({**self.defaults, **valid})
 
         if self.get("datasets_dir") == self.get("runs_dir"):
             LOGGER.warning(
-                f"WARNING ⚠️ Ultralytics setting 'datasets_dir: {self.get('datasets_dir')}' "
+                f"Ultralytics setting 'datasets_dir: {self.get('datasets_dir')}' "
                 f"must be different than 'runs_dir: {self.get('runs_dir')}'. "
                 f"Please change one to avoid possible issues during training. {self.help_msg}"
             )
 
+    def __setitem__(self, key, value):
+        """Update one key: value pair."""
+        self.update({key: value})
+
     def update(self, *args, **kwargs):
-        """Updates settings, validating keys and types."""
+        """Update settings, validating keys and types.
+
+        Raises:
+            KeyError: If a key is not a valid Ultralytics setting.
+            TypeError: If a value does not match the type of the setting's default.
+        """
+        kwargs = dict(*args, **kwargs)  # every form dict.update() accepts
         for k, v in kwargs.items():
             if k not in self.defaults:
                 raise KeyError(f"No Ultralytics setting '{k}'. {self.help_msg}")
             t = type(self.defaults[k])
             if not isinstance(v, t):
-                raise TypeError(f"Ultralytics setting '{k}' must be of type '{t}', not '{type(v)}'. {self.help_msg}")
-        super().update(*args, **kwargs)
+                raise TypeError(
+                    f"Ultralytics setting '{k}' must be '{t.__name__}' type, not '{type(v).__name__}'. {self.help_msg}"
+                )
+        super().update(kwargs)
 
     def reset(self):
-        """Resets the settings to default and saves them."""
+        """Reset the settings to default and save them."""
         self.clear()
         self.update(self.defaults)
 
 
-def deprecation_warn(arg, new_arg):
+def deprecation_warn(arg, new_arg=None):
     """Issue a deprecation warning when a deprecated argument is used, suggesting an updated argument."""
-    LOGGER.warning(f"WARNING ⚠️ '{arg}' is deprecated and will be removed in in the future. Use '{new_arg}' instead.")
+    msg = f"'{arg}' is deprecated and will be removed in the future."
+    if new_arg is not None:
+        msg += f" Use '{new_arg}' instead."
+    LOGGER.warning(msg)
 
 
 def clean_url(url):
-    """Strip auth from URL, i.e. https://url.com/file.txt?auth -> https://url.com/file.txt."""
+    """Strip auth from URL, e.g. `https://example.com/path/file.txt?auth` -> `https://example.com/path/file.txt`."""
     url = Path(url).as_posix().replace(":/", "://")  # Pathlib turns :// -> :/, as_posix() for Windows
-    return urllib.parse.unquote(url).split("?")[0]  # '%2F' to '/', split https://url.com/file.txt?auth
+    return unquote(url).split("?", 1)[0]  # '%2F' to '/', split authentication query strings
 
 
 def url2file(url):
-    """Convert URL to filename, i.e. https://url.com/file.txt?auth -> file.txt."""
-    return Path(clean_url(url)).name
+    """Convert URL to filename, e.g. `https://example.com/path/file.txt?auth` -> `file.txt`."""
+    return Path(clean_url(url)).name or "download"
 
 
 def vscode_msg(ext="ultralytics.ultralytics-snippets") -> str:
-    """Display a message to install Ultralytics-Snippets for VS Code if not already installed."""
+    """Return a message to install Ultralytics-Snippets for VS Code, or an empty string if already installed."""
     path = (USER_CONFIG_DIR.parents[2] if WINDOWS else USER_CONFIG_DIR.parents[1]) / ".vscode/extensions"
     obs_file = path / ".obsolete"  # file tracks uninstalled extensions, while source directory remains
     installed = any(path.glob(f"{ext}*")) and ext not in (obs_file.read_text("utf-8") if obs_file.exists() else "")
@@ -1284,7 +1791,6 @@ def vscode_msg(ext="ultralytics.ultralytics-snippets") -> str:
 # Check first-install steps
 PREFIX = colorstr("Ultralytics: ")
 SETTINGS = SettingsManager()  # initialize settings
-PERSISTENT_CACHE = JSONDict(USER_CONFIG_DIR / "persistent_cache.json")  # initialize persistent cache
 DATASETS_DIR = Path(SETTINGS["datasets_dir"])  # global datasets directory
 WEIGHTS_DIR = Path(SETTINGS["weights_dir"])  # global weights directory
 RUNS_DIR = Path(SETTINGS["runs_dir"])  # global runs directory
@@ -1303,10 +1809,7 @@ TESTS_RUNNING = is_pytest_running() or is_github_action_running()
 set_sentry()
 
 # Apply monkey patches
-from ultralytics.utils.patches import imread, imshow, imwrite, torch_load, torch_save
-
-torch.load = torch_load
 torch.save = torch_save
 if WINDOWS:
     # Apply cv2 patches for non-ASCII and non-UTF characters in image paths
-    cv2.imread, cv2.imwrite, cv2.imshow = imread, imwrite, imshow
+    cv2.imread, cv2.imwrite, cv2.imshow = imread_unicode, imwrite, imshow

@@ -1,17 +1,17 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
 
 import copy
-from typing import Optional
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
 from .blocks import RoPEAttention
 
 
 class MemoryAttentionLayer(nn.Module):
-    """
-    Implements a memory attention layer with self-attention and cross-attention mechanisms for neural networks.
+    """Implements a memory attention layer with self-attention and cross-attention mechanisms for neural networks.
 
     This class combines self-attention, cross-attention, and feedforward components to process input tensors and
     generate memory-based attention outputs.
@@ -44,7 +44,7 @@ class MemoryAttentionLayer(nn.Module):
         >>> layer = MemoryAttentionLayer(d_model=256, dim_feedforward=2048, dropout=0.1)
         >>> tgt = torch.randn(1, 100, 256)
         >>> memory = torch.randn(1, 100, 64)
-        >>> pos = torch.randn(1, 100, 256)
+        >>> pos = torch.randn(1, 100, 64)
         >>> query_pos = torch.randn(1, 100, 256)
         >>> output = layer(tgt, memory, pos, query_pos)
         >>> print(output.shape)
@@ -59,14 +59,27 @@ class MemoryAttentionLayer(nn.Module):
         pos_enc_at_attn: bool = False,
         pos_enc_at_cross_attn_keys: bool = True,
         pos_enc_at_cross_attn_queries: bool = False,
+        self_attn: nn.Module | None = None,
+        cross_attn: nn.Module | None = None,
     ):
-        """Initializes a memory attention layer with self-attention, cross-attention, and feedforward components."""
+        """Initialize a memory attention layer with self-attention, cross-attention, and feedforward components.
+
+        Args:
+            d_model (int): Dimensionality of the model.
+            dim_feedforward (int): Dimensionality of the feedforward network.
+            dropout (float): Dropout rate for regularization.
+            pos_enc_at_attn (bool): Whether to add positional encoding at attention.
+            pos_enc_at_cross_attn_keys (bool): Whether to add positional encoding to cross-attention keys.
+            pos_enc_at_cross_attn_queries (bool): Whether to add positional encoding to cross-attention queries.
+            self_attn (nn.Module | None): Custom self-attention module. If None, a default RoPEAttention is used.
+            cross_attn (nn.Module | None): Custom cross-attention module. If None, a default RoPEAttention is used.
+        """
         super().__init__()
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
         self.dropout_value = dropout
-        self.self_attn = RoPEAttention(embedding_dim=256, num_heads=1, downsample_rate=1)
-        self.cross_attn_image = RoPEAttention(
+        self.self_attn = self_attn or RoPEAttention(embedding_dim=256, num_heads=1, downsample_rate=1)
+        self.cross_attn_image = cross_attn or RoPEAttention(
             rope_k_repeat=True,
             embedding_dim=256,
             num_heads=1,
@@ -93,16 +106,23 @@ class MemoryAttentionLayer(nn.Module):
         self.pos_enc_at_cross_attn_queries = pos_enc_at_cross_attn_queries
         self.pos_enc_at_cross_attn_keys = pos_enc_at_cross_attn_keys
 
-    def _forward_sa(self, tgt, query_pos):
-        """Performs self-attention on input tensor using positional encoding and RoPE attention mechanism."""
+    def _forward_sa(self, tgt: torch.Tensor, query_pos: torch.Tensor | None) -> torch.Tensor:
+        """Perform self-attention on input tensor using positional encoding and RoPE attention mechanism."""
         tgt2 = self.norm1(tgt)
         q = k = tgt2 + query_pos if self.pos_enc_at_attn else tgt2
         tgt2 = self.self_attn(q, k, v=tgt2)
         tgt = tgt + self.dropout1(tgt2)
         return tgt
 
-    def _forward_ca(self, tgt, memory, query_pos, pos, num_k_exclude_rope=0):
-        """Performs cross-attention between target and memory tensors using RoPEAttention mechanism."""
+    def _forward_ca(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        query_pos: torch.Tensor | None,
+        pos: torch.Tensor | None,
+        num_k_exclude_rope: int = 0,
+    ) -> torch.Tensor:
+        """Perform cross-attention between target and memory tensors using RoPEAttention mechanism."""
         kwds = {}
         if num_k_exclude_rope > 0:
             assert isinstance(self.cross_attn_image, RoPEAttention)
@@ -121,13 +141,25 @@ class MemoryAttentionLayer(nn.Module):
 
     def forward(
         self,
-        tgt,
-        memory,
-        pos: Optional[Tensor] = None,
-        query_pos: Optional[Tensor] = None,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        pos: torch.Tensor | None = None,
+        query_pos: torch.Tensor | None = None,
         num_k_exclude_rope: int = 0,
     ) -> torch.Tensor:
-        """Processes input tensors using self-attention, cross-attention, and MLP for memory-based attention."""
+        """Process input tensors through self-attention, cross-attention, and feedforward network layers.
+
+        Args:
+            tgt (torch.Tensor): Target tensor for self-attention with shape (N, L, D).
+            memory (torch.Tensor): Memory tensor for cross-attention with shape (N, S, D_kv), where D_kv is the
+                cross-attention key/value input dimension (64 for the default cross-attention module).
+            pos (torch.Tensor | None): Positional encoding for memory tensor with the same shape as memory.
+            query_pos (torch.Tensor | None): Positional encoding for target tensor with the same shape as tgt.
+            num_k_exclude_rope (int): Number of keys to exclude from rotary position embedding.
+
+        Returns:
+            (torch.Tensor): Processed tensor after attention and feedforward layers with shape (N, L, D).
+        """
         tgt = self._forward_sa(tgt, query_pos)
         tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
         # MLP
@@ -138,11 +170,10 @@ class MemoryAttentionLayer(nn.Module):
 
 
 class MemoryAttention(nn.Module):
-    """
-    Memory attention module for processing sequential data with self and cross-attention mechanisms.
+    """Memory attention module for processing sequential data with self and cross-attention mechanisms.
 
-    This class implements a multi-layer attention mechanism that combines self-attention and cross-attention
-    for processing sequential data, particularly useful in transformer-like architectures.
+    This class implements a multi-layer attention mechanism that combines self-attention and cross-attention for
+    processing sequential data, particularly useful in transformer-like architectures.
 
     Attributes:
         d_model (int): The dimension of the model's hidden state.
@@ -150,7 +181,8 @@ class MemoryAttention(nn.Module):
         num_layers (int): The number of attention layers.
         norm (nn.LayerNorm): Layer normalization applied to the output.
         pos_enc_at_input (bool): Whether to apply positional encoding at the input.
-        batch_first (bool): Whether the input tensors are in batch-first format.
+        batch_first (bool): Whether the layers expect batch-first input, in which case sequence-first inputs are
+            transposed before and after the layers.
 
     Methods:
         forward: Processes input tensors through the attention layers.
@@ -159,13 +191,13 @@ class MemoryAttention(nn.Module):
         >>> d_model = 256
         >>> layer = MemoryAttentionLayer(d_model)
         >>> attention = MemoryAttention(d_model, pos_enc_at_input=True, layer=layer, num_layers=3)
-        >>> curr = torch.randn(10, 32, d_model)  # (seq_len, batch_size, d_model)
-        >>> memory = torch.randn(20, 32, d_model)  # (mem_len, batch_size, d_model)
-        >>> curr_pos = torch.randn(10, 32, d_model)
-        >>> memory_pos = torch.randn(20, 32, d_model)
+        >>> curr = torch.randn(16, 2, d_model)  # (seq_len, batch_size, d_model), 4x4 spatial tokens
+        >>> memory = torch.randn(32, 2, 64)  # (mem_len, batch_size, mem_dim)
+        >>> curr_pos = torch.randn(16, 2, d_model)
+        >>> memory_pos = torch.randn(32, 2, 64)
         >>> output = attention(curr, memory, curr_pos, memory_pos)
         >>> print(output.shape)
-        torch.Size([10, 32, 256])
+        torch.Size([16, 2, 256])
     """
 
     def __init__(
@@ -176,7 +208,19 @@ class MemoryAttention(nn.Module):
         num_layers: int,
         batch_first: bool = True,  # Do layers expect batch first input?
     ):
-        """Initializes MemoryAttention module with layers and normalization for attention processing."""
+        """Initialize MemoryAttention with specified layers and normalization for sequential data processing.
+
+        This class implements a multi-layer attention mechanism that combines self-attention and cross-attention for
+        processing sequential data, particularly useful in transformer-like architectures.
+
+        Args:
+            d_model (int): The dimension of the model's hidden state.
+            pos_enc_at_input (bool): Whether to apply positional encoding at the input.
+            layer (nn.Module): The attention layer to be used in the module.
+            num_layers (int): The number of attention layers.
+            batch_first (bool): Whether the layers expect batch-first input, in which case sequence-first inputs are
+                transposed before and after the layers.
+        """
         super().__init__()
         self.d_model = d_model
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
@@ -187,25 +231,48 @@ class MemoryAttention(nn.Module):
 
     def forward(
         self,
-        curr: torch.Tensor,  # self-attention inputs
+        curr: torch.Tensor | list[torch.Tensor],  # self-attention inputs
         memory: torch.Tensor,  # cross-attention inputs
-        curr_pos: Optional[Tensor] = None,  # pos_enc for self-attention inputs
-        memory_pos: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
+        curr_pos: torch.Tensor | list[torch.Tensor],  # pos_enc for self-attention inputs
+        memory_pos: torch.Tensor,  # pos_enc for cross-attention inputs
         num_obj_ptr_tokens: int = 0,  # number of object pointer *tokens*
-    ):
-        """Processes input tensors through multiple attention layers, applying self and cross-attention mechanisms."""
+    ) -> torch.Tensor:
+        """Process inputs through attention layers, applying self and cross-attention with positional encoding.
+
+        Args:
+            curr (torch.Tensor | list[torch.Tensor]): Self-attention input tensor representing the current state, with
+                shape (L, B, d_model), or a single-element list containing it.
+            memory (torch.Tensor): Cross-attention input tensor representing memory information, with shape (S, B, C).
+            curr_pos (torch.Tensor | list[torch.Tensor]): Positional encoding for self-attention inputs, matching the
+                type and shape of curr.
+            memory_pos (torch.Tensor): Positional encoding for cross-attention inputs with the same shape as memory.
+            num_obj_ptr_tokens (int): Number of object pointer tokens to exclude from rotary position embedding.
+
+        Returns:
+            (torch.Tensor): Processed output tensor after applying attention layers and normalization, with shape (L, B,
+                d_model).
+
+        Examples:
+            >>> d_model = 256
+            >>> layer = MemoryAttentionLayer(d_model)
+            >>> attention = MemoryAttention(d_model, pos_enc_at_input=True, layer=layer, num_layers=3)
+            >>> curr = torch.randn(16, 2, d_model)  # (seq_len, batch_size, d_model), 4x4 spatial tokens
+            >>> memory = torch.randn(32, 2, 64)  # (mem_len, batch_size, mem_dim)
+            >>> curr_pos = torch.randn(16, 2, d_model)
+            >>> memory_pos = torch.randn(32, 2, 64)
+            >>> output = attention(curr, memory, curr_pos, memory_pos)
+            >>> print(output.shape)
+            torch.Size([16, 2, 256])
+        """
         if isinstance(curr, list):
             assert isinstance(curr_pos, list)
             assert len(curr) == len(curr_pos) == 1
-            curr, curr_pos = (
-                curr[0],
-                curr_pos[0],
-            )
+            curr, curr_pos = curr[0], curr_pos[0]
 
         assert curr.shape[1] == memory.shape[1], "Batch size must be the same for curr and memory"
 
         output = curr
-        if self.pos_enc_at_input and curr_pos is not None:
+        if self.pos_enc_at_input:
             output = output + 0.1 * curr_pos
 
         if self.batch_first:
@@ -232,6 +299,5 @@ class MemoryAttention(nn.Module):
         if self.batch_first:
             # Convert back to seq first
             normed_output = normed_output.transpose(0, 1)
-            curr_pos = curr_pos.transpose(0, 1)
 
         return normed_output

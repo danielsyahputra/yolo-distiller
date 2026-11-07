@@ -1,15 +1,18 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-# YOLO26-cls image classification model. For Usage examples see https://docs.ultralytics.com/tasks/classify
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Ultralytics YOLO26-cls image classification model
+# Model docs: https://docs.ultralytics.com/models/yolo26
+# Task docs: https://docs.ultralytics.com/tasks/classify
 
 # Parameters
-nc: 80 # number of classes
+nc: 1000 # number of classes
 scales: # model compound scaling constants, i.e. 'model=yolo26n-cls.yaml' will call yolo26-cls.yaml with scale 'n'
   # [depth, width, max_channels]
-  n: [0.50, 0.25, 1024]
-  s: [0.50, 0.50, 1024]
-  m: [0.50, 1.00, 512]
-  l: [1.00, 1.00, 512]
-  x: [1.00, 1.50, 512]
+  n: [0.50, 0.25, 1024] # summary: 86 layers, 2,812,104 parameters, 2,812,104 gradients, 0.5 GFLOPs
+  s: [0.50, 0.50, 1024] # summary: 86 layers, 6,724,008 parameters, 6,724,008 gradients, 1.6 GFLOPs
+  m: [0.50, 1.00, 512] # summary: 106 layers, 11,634,216 parameters, 11,634,216 gradients, 5.0 GFLOPs
+  l: [1.00, 1.00, 512] # summary: 176 layers, 14,115,624 parameters, 14,115,624 gradients, 6.2 GFLOPs
+  x: [1.00, 1.50, 512] # summary: 176 layers, 29,637,064 parameters, 29,637,064 gradients, 13.7 GFLOPs
 
 # YOLO26n backbone
 backbone:
@@ -28,4 +31,3 @@ backbone:
 # YOLO26n head
 head:
   - [-1, 1, Classify, [nc]] # Classify
-

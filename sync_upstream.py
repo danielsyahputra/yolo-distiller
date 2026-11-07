@@ -22,13 +22,15 @@ TARBALL_URL = "https://codeload.github.com/ultralytics/ultralytics/tar.gz/refs/h
 
 KD_CLASSES_CODE = '''
 import torch.nn.functional as F
-from ultralytics.utils.torch_utils import de_parallel
 
-try:
-    from ultralytics.utils.torch_utils import autocast
-except ImportError:
+if "autocast" not in globals():
     def autocast(enabled: bool):
         return torch.amp.autocast("cuda", enabled=bool(enabled))
+
+
+def _unwrap_model(m: nn.Module) -> nn.Module:
+    """Unwrap DataParallel or DistributedDataParallel model to its base nn.Module."""
+    return m.module if hasattr(m, "module") else m
 
 
 class CWDLoss(nn.Module):
@@ -146,8 +148,8 @@ class DistillationLoss:
     def __init__(self, models, modelt, distiller="cwd", device=None):
         self.distiller = (distiller or "cwd").lower()[:3]
         self.layers = ["6", "8", "13", "16", "19", "22"]
-        self.models = de_parallel(models)
-        self.modelt = de_parallel(modelt)
+        self.models = _unwrap_model(models)
+        self.modelt = _unwrap_model(modelt)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.channels_s = []
@@ -168,7 +170,7 @@ class DistillationLoss:
 
     @classmethod
     def _extract_model_layers(cls, model, default_layers):
-        base = de_parallel(model)
+        base = _unwrap_model(model)
         seq = getattr(base, "model", None)
         if isinstance(seq, nn.Sequential) and len(seq) > 0:
             head = seq[-1]
@@ -347,6 +349,7 @@ self.distillation_loss = None""",
         """\
 if getattr(self, "teacher", None) is not None:
     if isinstance(self.teacher, (str, Path)):
+        from ultralytics.nn.tasks import attempt_load_one_weight
         self.teacher, _ = attempt_load_one_weight(str(self.teacher))
     elif hasattr(self.teacher, "model") and isinstance(self.teacher.model, nn.Module) and not hasattr(self.teacher, "criterion"):
         self.teacher = self.teacher.model
@@ -433,9 +436,9 @@ if getattr(self, "teacher", None) is not None and getattr(self, "distillation_lo
 def sync_ultralytics(force: bool = False) -> bool:
     """Downloads latest official Ultralytics if not yet synced from upstream (or force=True) and applies KD patches."""
     init_py = ROOT / "ultralytics" / "__init__.py"
-    sync_marker = ROOT / "ultralytics" / ".synced_v26_r2"
+    sync_marker = ROOT / "ultralytics" / ".synced_v26_r3"
     has_upstream_v26 = sync_marker.exists() or (
-        init_py.exists() and "# UPSTREAM_SYNCED_V26_R2" in init_py.read_text(encoding="utf-8")
+        init_py.exists() and "# UPSTREAM_SYNCED_V26_R3" in init_py.read_text(encoding="utf-8")
     )
 
     if not has_upstream_v26 or force:
@@ -457,9 +460,9 @@ def sync_ultralytics(force: bool = False) -> bool:
                             shutil.copytree(src_ultralytics, ROOT / "ultralytics")
                             init_text = (ROOT / "ultralytics" / "__init__.py").read_text(encoding="utf-8")
                             (ROOT / "ultralytics" / "__init__.py").write_text(
-                                init_text + "\n# UPSTREAM_SYNCED_V26_R2\n", encoding="utf-8"
+                                init_text + "\n# UPSTREAM_SYNCED_V26_R3\n", encoding="utf-8"
                             )
-                            (ROOT / "ultralytics" / ".synced_v26_r2").write_text("synced\n", encoding="utf-8")
+                            (ROOT / "ultralytics" / ".synced_v26_r3").write_text("synced\n", encoding="utf-8")
                         src_pyproject = src_root / "pyproject.toml"
                         if src_pyproject.exists():
                             shutil.copy2(src_pyproject, ROOT / "pyproject.toml")

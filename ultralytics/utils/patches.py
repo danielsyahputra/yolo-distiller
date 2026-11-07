@@ -1,42 +1,167 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Monkey patches to update/extend functionality of existing functions."""
 
+from __future__ import annotations
+
 import time
+from contextlib import contextmanager
+from copy import copy
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image, ImageOps
 
 # OpenCV Multilanguage-friendly functions ------------------------------------------------------------------------------
 _imshow = cv2.imshow  # copy to avoid recursion errors
+PIL_FALLBACK_SUFFIXES = (".avif", ".heic", ".heif")  # formats needing the lazy-PIL decode fallback
 
 
-def imread(filename: str, flags: int = cv2.IMREAD_COLOR):
+def imread(filename: str | Path, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    """Read an image from a file with multilanguage filename support.
+
+    Args:
+        filename (str | Path): Path to the file to read.
+        flags (int, optional): Flag that can take values of cv2.IMREAD_*. Controls how the image is read.
+
+    Returns:
+        (np.ndarray | None): The read image array, or None if reading fails.
+
+    Examples:
+        >>> img = imread("path/to/image.jpg")
+        >>> img = imread("path/to/image.jpg", cv2.IMREAD_GRAYSCALE)
+
+    Notes:
+        - Only cv2.IMREAD_UNCHANGED stacks the same-size pages of a multi-page grayscale TIFF as channels and keeps
+          every band of a color TIFF, such as alpha or near-infrared. Other flags, and TIFFs with mixed page sizes such
+          as Cloud Optimized GeoTIFFs, return the first page, so scanned documents read as one page.
+        - 16-bit images keep their high byte as 8-bit, unless flags explicitly include cv2.IMREAD_ANYDEPTH.
+          cv2.IMREAD_UNCHANGED preserves channels but still converts 16-bit images to 8-bit.
     """
-    Read an image from a file.
+    filename = str(filename)
+    try:
+        file_bytes = np.fromfile(filename, np.uint8)
+    except (FileNotFoundError, OSError):
+        return None
+    if not file_bytes.size:  # empty file, cv2 decoders assert on an empty buffer
+        return None
+    im = None
+    if flags != cv2.IMREAD_GRAYSCALE and filename.lower().endswith((".tiff", ".tif")):
+        success, frames = cv2.imdecodemulti(file_bytes, cv2.IMREAD_UNCHANGED)
+        stack = flags == cv2.IMREAD_UNCHANGED and len(frames) > 1 and all(f.shape == frames[0].shape for f in frames)
+        if success and (frames[0].ndim == 3 or stack):
+            im = frames[0] if frames[0].ndim == 3 else np.stack(frames, axis=2)  # color pages keep the first page
+            im = im if flags == cv2.IMREAD_UNCHANGED else im[..., :3]  # BGR, alpha dropped
+    if im is None and filename.lower().endswith(PIL_FALLBACK_SUFFIXES):
+        im = _imread_pil(filename, flags)  # EXIF-aware
+    if im is None:
+        im = cv2.imdecode(file_bytes, flags)
+    if im is not None and im.dtype == np.uint16 and (flags == cv2.IMREAD_UNCHANGED or not flags & cv2.IMREAD_ANYDEPTH):
+        im = (im >> 8).astype(np.uint8)
+    return im[..., None] if im is not None and im.ndim == 2 else im  # Always ensure 3 dimensions
+
+
+# PIL patches ---------------------------------------------------------------------------------------------------------
+_image_open = Image.open  # copy to avoid recursion errors
+_pil_plugins_registered = False
+
+
+def image_open(filename, *args, **kwargs):
+    """Open an image with PIL, lazily registering the HEIF plugin the first time Pillow cannot identify a file.
+
+    This monkey-patches PIL.Image.open to add HEIC/HEIF support via pi-heif (lightweight, decode-only), avoiding the
+    ~800ms startup cost of importing the package unless actually needed. Only `PIL.UnidentifiedImageError` triggers the
+    plugin install and retry; other errors, such as a missing or unreadable file, are raised unchanged. AVIF is decoded
+    natively by Pillow 11.3+ wheels and does not require a plugin.
+
+    Args:
+        filename (str | Path | IO[bytes]): Path to the image file or a binary file object.
+        *args (Any): Additional positional arguments passed to PIL.Image.open.
+        **kwargs (Any): Additional keyword arguments passed to PIL.Image.open.
+
+    Returns:
+        (PIL.Image.Image): The opened PIL image.
+    """
+    global _pil_plugins_registered
+    if _pil_plugins_registered:
+        return _image_open(filename, *args, **kwargs)
+    try:
+        return _image_open(filename, *args, **kwargs)
+    except Image.UnidentifiedImageError:
+        from ultralytics.utils.checks import check_requirements
+
+        check_requirements("pi-heif")
+        from pi_heif import register_heif_opener
+
+        register_heif_opener()
+        _pil_plugins_registered = True
+        return _image_open(filename, *args, **kwargs)
+
+
+Image.open = image_open  # apply patch
+
+
+def _imread_pil(filename: str, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    """Read an image using PIL as fallback for formats not supported by OpenCV.
 
     Args:
         filename (str): Path to the file to read.
-        flags (int, optional): Flag that can take values of cv2.IMREAD_*. Defaults to cv2.IMREAD_COLOR.
+        flags (int, optional): OpenCV imread flags (used to determine grayscale conversion).
 
     Returns:
-        (np.ndarray): The read image.
+        (np.ndarray | None): The read image array in BGR format, or None if reading fails.
     """
-    return cv2.imdecode(np.fromfile(filename, np.uint8), flags)
+    try:
+        with ImageOps.exif_transpose(Image.open(filename)) as img:  # upright, like cv2 JPEG decodes
+            if flags == cv2.IMREAD_GRAYSCALE:
+                return np.asarray(img.convert("L"))
+            return cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    except Exception:
+        return None
 
 
-def imwrite(filename: str, img: np.ndarray, params=None):
-    """
-    Write an image to a file.
+def imread_unicode(filename: str | Path, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    """Read an image with multilanguage filename support, preserving native cv2.imread behavior.
+
+    This is intended as a Windows monkey-patch for cv2.imread. Decoding from bytes also reads EXIF-rotated TIFFs, which
+    file-based cv2.imread returns as None on OpenCV >= 4.12. Unlike `imread`, it does not expand grayscale dimensions or
+    handle TIFF/AVIF/HEIC fallback.
 
     Args:
-        filename (str): Path to the file to write.
-        img (np.ndarray): Image to write.
-        params (list of ints, optional): Additional parameters. See OpenCV documentation.
+        filename (str | Path): Path to the file to read.
+        flags (int, optional): Flag that can take values of cv2.IMREAD_*.
 
     Returns:
-        (bool): True if the file was written, False otherwise.
+        (np.ndarray | None): The read image array, or None if reading fails.
+    """
+    try:
+        file_bytes = np.fromfile(filename, np.uint8)
+    except (FileNotFoundError, OSError):
+        return None
+    if not file_bytes.size:  # empty file, cv2 decoders assert on an empty buffer
+        return None
+    return cv2.imdecode(file_bytes, flags)
+
+
+def imwrite(filename: str | Path, img: np.ndarray, params: list[int] | None = None) -> bool:
+    """Write an image to a file with multilanguage filename support.
+
+    Args:
+        filename (str | Path): Path to the file to write.
+        img (np.ndarray): Image to write.
+        params (list[int], optional): Additional parameters for image encoding.
+
+    Returns:
+        (bool): True if the file was written successfully, False otherwise.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.zeros((100, 100, 3), dtype=np.uint8)  # Create a black image
+        >>> success = imwrite("output.jpg", img)  # Write image to file
+        >>> print(success)
+        True
     """
     try:
         cv2.imencode(Path(filename).suffix, img, params)[1].tofile(filename)
@@ -45,27 +170,34 @@ def imwrite(filename: str, img: np.ndarray, params=None):
         return False
 
 
-def imshow(winname: str, mat: np.ndarray):
-    """
-    Displays an image in the specified window.
+def imshow(winname: str, mat: np.ndarray) -> None:
+    """Display an image in the specified window with multilanguage window name support.
+
+    This function is a wrapper around OpenCV's imshow function that displays an image in a named window. It handles
+    multilanguage window names by encoding them properly for OpenCV compatibility.
 
     Args:
-        winname (str): Name of the window.
-        mat (np.ndarray): Image to be shown.
+        winname (str): Name of the window where the image will be displayed. If a window with this name already exists,
+            the image will be displayed in that window.
+        mat (np.ndarray): Image to be shown. Should be a valid numpy array representing an image.
+
+    Examples:
+        >>> import numpy as np
+        >>> img = np.zeros((300, 300, 3), dtype=np.uint8)  # Create a black image
+        >>> img[:100, :100] = [255, 0, 0]  # Add a blue square
+        >>> imshow("Example Window", img)  # Display the image
     """
     _imshow(winname.encode("unicode_escape").decode(), mat)
 
 
 # PyTorch functions ----------------------------------------------------------------------------------------------------
-_torch_load = torch.load  # copy to avoid recursion errors
 _torch_save = torch.save
 
 
 def torch_load(*args, **kwargs):
-    """
-    Load a PyTorch model with updated arguments to avoid warnings.
+    """Load a PyTorch object with `weights_only=False` by default so full checkpoints can be unpickled.
 
-    This function wraps torch.load and adds the 'weights_only' argument for PyTorch 1.13.0+ to prevent warnings.
+    This function wraps torch.load and adds the 'weights_only' argument for PyTorch 1.13.0+.
 
     Args:
         *args (Any): Variable length argument list to pass to torch.load.
@@ -74,31 +206,110 @@ def torch_load(*args, **kwargs):
     Returns:
         (Any): The loaded PyTorch object.
 
-    Note:
-        For PyTorch versions 2.0 and above, this function automatically sets 'weights_only=False'
-        if the argument is not provided, to avoid deprecation warnings.
+    Notes:
+        For PyTorch versions 1.13 and above, this function automatically sets `weights_only=False` if the argument is
+        not provided, since PyTorch 2.6+ defaults to `weights_only=True`, which rejects full model checkpoints, and
+        PyTorch 2.4-2.5 emit a FutureWarning when the argument is omitted.
     """
     from ultralytics.utils.torch_utils import TORCH_1_13
 
-    if TORCH_1_13 and "weights_only" not in kwargs:
-        kwargs["weights_only"] = False
+    if TORCH_1_13:
+        kwargs.setdefault("weights_only", False)
+    else:
+        kwargs.pop("weights_only", None)
 
-    return _torch_load(*args, **kwargs)
+    return torch.load(*args, **kwargs)
 
 
 def torch_save(*args, **kwargs):
-    """
-    Optionally use dill to serialize lambda functions where pickle does not, adding robustness with 3 retries and
-    exponential standoff in case of save failure.
+    """Save PyTorch objects with retry mechanism for robustness.
+
+    This function wraps torch.save with 3 retries and exponential backoff in case of save failures, which can occur due
+    to device flushing delays or antivirus scanning.
 
     Args:
-        *args (tuple): Positional arguments to pass to torch.save.
+        *args (Any): Positional arguments to pass to torch.save.
         **kwargs (Any): Keyword arguments to pass to torch.save.
+
+    Examples:
+        >>> model = torch.nn.Linear(10, 1)
+        >>> torch_save(model.state_dict(), "model.pt")
     """
     for i in range(4):  # 3 retries
         try:
             return _torch_save(*args, **kwargs)
-        except RuntimeError as e:  # unable to save, possibly waiting for device to flush or antivirus scan
+        except RuntimeError:  # Unable to save, possibly waiting for device to flush or antivirus scan
             if i == 3:
-                raise e
-            time.sleep((2**i) / 2)  # exponential standoff: 0.5s, 1.0s, 2.0s
+                raise
+            time.sleep((2**i) / 2)  # Exponential backoff: 0.5s, 1.0s, 2.0s
+
+
+@contextmanager
+def arange_patch(dynamic: bool = False, quantize: int | str | None = None, fmt: str = ""):
+    """Workaround for ONNX torch.arange incompatibility with FP16.
+
+    Patches torch.arange only for dynamic FP16 ONNX exports, see https://github.com/pytorch/pytorch/issues/148041.
+
+    Args:
+        dynamic (bool): Whether the export uses dynamic input shapes.
+        quantize (int | str | None): Export precision; the patch applies only when 16 (FP16).
+        fmt (str): Export format; the patch applies only for 'onnx'.
+    """
+    if dynamic and quantize == 16 and fmt == "onnx":
+        func = torch.arange
+
+        def arange(*args, dtype=None, **kwargs):
+            """Wrap torch.arange to cast dtype after creation instead of passing it directly."""
+            return func(*args, **kwargs).to(dtype)  # cast to dtype instead of passing dtype
+
+        torch.arange = arange  # patch
+        try:
+            yield
+        finally:
+            torch.arange = func  # unpatch
+    else:
+        yield
+
+
+@contextmanager
+def onnx_export_patch():
+    """Workaround for ONNX export issues in PyTorch 2.9+ with Dynamo enabled."""
+    from ultralytics.utils.torch_utils import TORCH_2_9
+
+    if TORCH_2_9:
+        func = torch.onnx.export
+
+        def torch_export(*args, **kwargs):
+            """Export model to ONNX format with Dynamo disabled for compatibility."""
+            return func(*args, **kwargs, dynamo=False)
+
+        torch.onnx.export = torch_export  # patch
+        try:
+            yield
+        finally:
+            torch.onnx.export = func  # unpatch
+    else:
+        yield
+
+
+@contextmanager
+def override_configs(args, overrides: dict[str, Any] | None = None):
+    """Context manager to temporarily override configurations in args.
+
+    Args:
+        args (IterableSimpleNamespace): Original configuration arguments.
+        overrides (dict[str, Any] | None): Dictionary of overrides to apply.
+
+    Yields:
+        (IterableSimpleNamespace): Configuration arguments with overrides applied.
+    """
+    if overrides:
+        original_args = copy(args)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        try:
+            yield args
+        finally:
+            args.__dict__.update(original_args.__dict__)
+    else:
+        yield args

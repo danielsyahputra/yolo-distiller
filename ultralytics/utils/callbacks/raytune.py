@@ -1,23 +1,31 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
-
-from ultralytics.utils import SETTINGS
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 try:
-    assert SETTINGS["raytune"] is True  # verify integration is enabled
-    import ray
     from ray import tune
-    from ray.air import session
 
+    assert hasattr(tune, "get_context")  # verify Ray>=2.41 Tune API, also required by tuner.run_ray_tune
 except (ImportError, AssertionError):
     tune = None
 
 
 def on_fit_epoch_end(trainer):
-    """Sends training metrics to Ray Tune at end of each epoch."""
-    if ray.train._internal.session._get_session():  # replacement for deprecated ray.tune.is_session_enabled()
-        metrics = trainer.metrics
-        metrics["epoch"] = trainer.epoch
-        session.report(metrics)
+    """Report training metrics to Ray Tune at epoch end when a Ray session is active.
+
+    Captures metrics from the trainer object and sends them to Ray Tune with the current epoch number, enabling
+    hyperparameter tuning optimization. Only executes when within an active Ray Tune session.
+
+    Args:
+        trainer (ultralytics.engine.trainer.BaseTrainer): The Ultralytics trainer object containing metrics and epochs.
+
+    Examples:
+        >>> # Called automatically by the Ultralytics training loop
+        >>> on_fit_epoch_end(trainer)
+
+    References:
+        Ray Tune docs: https://docs.ray.io/en/latest/tune/index.html
+    """
+    if tune.get_context().get_trial_id():  # check if Ray Tune session is active
+        tune.report({**trainer.metrics, "epoch": trainer.epoch + 1})
 
 
 callbacks = (

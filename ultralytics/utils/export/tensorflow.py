@@ -1,0 +1,312 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
+
+import contextlib
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from ultralytics.nn.modules import Detect, Pose, Pose26
+from ultralytics.utils import ARM64, AUTOINSTALL, LINUX, LOGGER, MACOS, USER_CONFIG_DIR
+from ultralytics.utils.checks import IS_PYTHON_MINIMUM_3_13, ONNXRUNTIME_BUILDS, check_requirements, check_version
+from ultralytics.utils.downloads import attempt_download_asset, safe_download
+from ultralytics.utils.tal import make_anchors
+
+
+def tf_wrapper(model: torch.nn.Module) -> torch.nn.Module:
+    """Patch Detect and Pose head decoding with TensorFlow-export-compatible normalized implementations.
+
+    Args:
+        model (torch.nn.Module): Model whose Detect (and Pose) heads are patched in place.
+
+    Returns:
+        (torch.nn.Module): The same model with patched head methods.
+    """
+    for m in model.modules():
+        if not isinstance(m, Detect):
+            continue
+        import types
+
+        m._get_decode_boxes = types.MethodType(_tf_decode_boxes, m)
+        if isinstance(m, Pose):
+            m.kpts_decode = types.MethodType(partial(_tf_kpts_decode, is_pose26=type(m) is Pose26), m)
+    return model
+
+
+def _tf_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Decode bounding boxes for TensorFlow export."""
+    shape = x["feats"][0].shape  # BCHW
+    boxes = x["boxes"]
+    if self.format != "imx" and (self.dynamic or self.shape != shape):
+        self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
+        self.shape = shape
+    grid_h, grid_w = shape[2:4]
+    grid_size = torch.tensor([grid_w, grid_h, grid_w, grid_h], device=boxes.device).reshape(1, 4, 1)
+    norm = self.strides / (self.stride[0] * grid_size)
+    dbox = self.decode_bboxes(self.dfl(boxes) * norm, self.anchors.unsqueeze(0) * norm[:, :2], x.get("angle"))
+    return dbox
+
+
+def _tf_kpts_decode(self, kpts: torch.Tensor, is_pose26: bool = False) -> torch.Tensor:
+    """Decode keypoints for TensorFlow export."""
+    ndim = self.kpt_shape[1]
+    bs = kpts.shape[0]
+    # Precompute normalization factor to increase numerical stability
+    y = kpts.view(bs, *self.kpt_shape, -1)
+    grid_h, grid_w = self.shape[2:4]
+    grid_size = torch.tensor([grid_w, grid_h], device=y.device).reshape(1, 2, 1)
+    norm = self.strides / (self.stride[0] * grid_size)
+    a = ((y[:, :, :2] + self.anchors) if is_pose26 else (y[:, :, :2] * 2.0 + (self.anchors - 0.5))) * norm
+    if ndim == 3:
+        a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+    return a.view(bs, self.nk, -1)
+
+
+def onnx2saved_model(
+    onnx_file: str,
+    output_dir: Path | str,
+    quantize: int | str | None = None,
+    images: np.ndarray | None = None,
+    disable_group_convolution: bool = False,
+    cuda: bool = False,
+    prefix: str = "",
+):
+    """Convert an ONNX model to TensorFlow SavedModel format using onnx2tf.
+
+    Args:
+        onnx_file (str): ONNX file path.
+        output_dir (Path | str): Output directory path for the SavedModel.
+        quantize (int | str | None): Precision scheme, 8 for INT8.
+        images (np.ndarray | None, optional): Calibration images for INT8 quantization in BHWC format.
+        disable_group_convolution (bool, optional): Disable group convolution optimization. Defaults to False.
+        cuda (bool, optional): True if exporting on a CUDA device; selects GPU onnxruntime and keeps GPUs visible to
+            TensorFlow, which are otherwise hidden so CPU exports never touch GPU memory. Defaults to False.
+        prefix (str, optional): Logging prefix. Defaults to "".
+
+    Returns:
+        (keras.Model): Converted Keras model.
+
+    Notes:
+        - Auto-installs tensorflow, onnx2tf, and all required dependencies if not present.
+        - Downloads the onnx2tf calibration sample data file if not already present.
+        - Removes temporary files and renames quantized models after conversion.
+    """
+    try:
+        import tensorflow as tf
+    except ImportError:
+        check_requirements("tensorflow>2.19.0" if IS_PYTHON_MINIMUM_3_13 else "tensorflow>=2.0.0,<=2.19.0")
+    check_requirements(
+        "onnx2tf>=1.26.3,<1.29.0",  # pin to avoid h5py build issues on aarch64
+        cmds="--no-deps",
+    )
+    ort = "onnxruntime-gpu[cuda]" if cuda else "onnxruntime"
+    check_requirements(
+        (
+            f"tf_keras{'>2.19.0' if IS_PYTHON_MINIMUM_3_13 else '<=2.19.0'}",  # required by 'onnx2tf' package
+            "sng4onnx>=1.0.1",  # required by 'onnx2tf' package
+            "onnx_graphsurgeon>=0.3.26",  # required by 'onnx2tf' package
+            "ai-edge-litert>=1.2.0" + (",<1.4.0" if MACOS else ""),  # required by 'onnx2tf' package
+            "onnx>=1.12.0,<2.0.0",
+            "onnxslim>=0.1.82",
+            # Interchangeable candidates so an installed variant is never dual-installed over
+            (ort, *ONNXRUNTIME_BUILDS),
+        )
+    )
+    # Checked last as TF<=2.19 installs downgrade protobuf below the ONNX gencode; cap <7 to avoid PaddlePaddle segfault
+    check_requirements("protobuf>=6.31.1,<7.0.0")
+    import tensorflow as tf
+
+    if not cuda:
+        with contextlib.suppress(Exception):  # fails only if TF GPUs are already initialized by earlier user code
+            tf.config.set_visible_devices([], "GPU")  # hide GPUs so non-CUDA exports never allocate GPU memory
+
+    LOGGER.info(f"\n{prefix} starting export with tensorflow {tf.__version__}...")
+    check_version(
+        tf.__version__,
+        ">=2.0.0",
+        name="tensorflow",
+        verbose=True,
+        msg="https://github.com/ultralytics/ultralytics/issues/5161",
+    )
+
+    output_dir = Path(output_dir)
+    use_int8 = quantize == 8
+    # Pre-download calibration file to fix https://github.com/PINTO0309/onnx2tf/issues/545
+    onnx2tf_file = Path("calibration_image_sample_data_20x128x128x3_float32.npy")
+    if not onnx2tf_file.exists():
+        attempt_download_asset(f"{onnx2tf_file}.zip", unzip=True, delete=True)
+    np_data = None
+    if use_int8:
+        tmp_file = output_dir / "tmp_tflite_int8_calibration_images.npy"  # int8 calibration images file
+        if images is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            np.save(str(tmp_file), images)  # BHWC
+            del images
+            np_data = [["images", tmp_file, [[[[0, 0, 0]]]], [[[[255, 255, 255]]]]]]
+
+    # Patch onnx.helper for onnx_graphsurgeon compatibility with ONNX>=1.17
+    # The float32_to_bfloat16 function was removed in ONNX 1.17, but onnx_graphsurgeon still uses it
+    import onnx.helper
+
+    if not hasattr(onnx.helper, "float32_to_bfloat16"):
+        import struct
+
+        def float32_to_bfloat16(fval):
+            """Convert float32 to bfloat16 (truncates lower 16 bits of mantissa)."""
+            ival = struct.unpack("=I", struct.pack("=f", fval))[0]
+            return ival >> 16
+
+        onnx.helper.float32_to_bfloat16 = float32_to_bfloat16
+
+    import importlib
+    import inspect
+    import pathlib
+
+    import onnx2tf.ops.TopK as _t
+
+    _path = pathlib.Path(inspect.getfile(_t))
+    _text = _path.read_text()
+    _patched = _text.replace(
+        "k_tensor = int(k_tensor)",
+        "k_tensor = int(k_tensor.squeeze()) if hasattr(k_tensor, 'squeeze') else int(k_tensor)",
+    )
+    if _patched != _text:  # write only when unpatched; site-packages may be read-only (pre-patched containers)
+        try:
+            _path.write_text(_patched)
+            importlib.reload(_t)
+        except OSError as e:  # read-only install: continue unpatched, only TopK-containing models are affected
+            LOGGER.warning(f"{prefix} unable to apply onnx2tf TopK patch: {e}")
+    import onnx2tf  # scoped for after ONNX export for reduced conflict during import
+
+    LOGGER.info(f"{prefix} starting TFLite export with onnx2tf {onnx2tf.__version__}...")
+    keras_model = onnx2tf.convert(
+        input_onnx_file_path=onnx_file,
+        output_folder_path=str(output_dir),
+        not_use_onnxsim=True,
+        verbosity="error",  # note INT8-FP16 activation bug https://github.com/ultralytics/ultralytics/issues/15873
+        output_integer_quantized_tflite=use_int8,
+        custom_input_op_name_np_data_path=np_data,
+        enable_batchmatmul_unfold=not use_int8,  # fix lower no. of detected objects on GPU delegate
+        output_signaturedefs=True,  # fix error with Attention block group convolution
+        disable_group_convolution=disable_group_convolution,  # fix error with group convolution
+    )
+
+    # Remove/rename TFLite models
+    if use_int8:
+        tmp_file.unlink(missing_ok=True)
+        for file in output_dir.rglob("*_dynamic_range_quant.tflite"):
+            file.rename(file.with_name(file.stem.replace("_dynamic_range_quant", "_int8") + file.suffix))
+        for file in output_dir.rglob("*_integer_quant_with_int16_act.tflite"):
+            file.unlink()  # delete extra fp16 activation TFLite files
+    return keras_model
+
+
+def keras2pb(keras_model, output_file: Path | str, prefix: str = "") -> str:
+    """Convert a Keras model to TensorFlow GraphDef (.pb) format.
+
+    Args:
+        keras_model (keras.Model): Keras model to convert to frozen graph format.
+        output_file (Path | str): Output ``.pb`` file path.
+        prefix (str, optional): Logging prefix. Defaults to "".
+
+    Returns:
+        (str): Path to the exported ``.pb`` file.
+
+    Notes:
+        Creates a frozen graph by converting variables to constants for inference optimization.
+    """
+    import tensorflow as tf
+    from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+
+    LOGGER.info(f"\n{prefix} starting export with tensorflow {tf.__version__}...")
+    m = tf.function(lambda x: keras_model(x))  # full model
+    m = m.get_concrete_function(tf.TensorSpec(keras_model.inputs[0].shape, keras_model.inputs[0].dtype))
+    frozen_func = convert_variables_to_constants_v2(m)
+    frozen_func.graph.as_graph_def()
+    output_file = Path(output_file)
+    tf.io.write_graph(
+        graph_or_graph_def=frozen_func.graph, logdir=str(output_file.parent), name=output_file.name, as_text=False
+    )
+    return str(output_file)
+
+
+def tflite2edgetpu(tflite_file: str | Path, output_dir: str | Path, prefix: str = "") -> str:
+    """Convert a TensorFlow Lite model to Edge TPU format using the Edge TPU compiler.
+
+    Args:
+        tflite_file (str | Path): Path to the input TensorFlow Lite (.tflite) model file.
+        output_dir (str | Path): Output directory path for the compiled Edge TPU model.
+        prefix (str, optional): Logging prefix. Defaults to "".
+
+    Returns:
+        (str): Path to the exported Edge TPU model file.
+
+    Raises:
+        FileNotFoundError: If the Edge TPU compiler is missing and auto-install is disabled.
+
+    Notes:
+        Auto-installs the Edge TPU compiler if not found. The function compiles the TFLite model
+        for optimal performance on Google's Edge TPU hardware accelerator.
+    """
+    import shlex
+    import shutil
+    import subprocess
+
+    help_url = "https://coral.ai/docs/edgetpu/compiler/"
+    assert LINUX and not ARM64, f"export only supported on Linux x86_64. See {help_url}"
+    # Google's Coral apt repo is gone, so a missing compiler installs from the unmodified edgetpu-compiler 16.0
+    # package files, needing no apt or sudo
+    bundle = USER_CONFIG_DIR / "edgetpu-compiler" / "usr" / "bin" / "edgetpu_compiler_bin"
+    system = shutil.which("edgetpu_compiler")
+    if not system and not (bundle / "edgetpu_compiler").is_file():
+        if not AUTOINSTALL:
+            raise FileNotFoundError(
+                f"Edge TPU compiler not found and YOLO_AUTOINSTALL=False. Install it from {help_url}"
+            )
+        LOGGER.info(f"\n{prefix} export requires Edge TPU compiler, downloading...")
+        safe_download(
+            "https://github.com/ultralytics/assets/releases/download/v0.0.0/edgetpu-compiler_16.0_amd64.tar.gz",
+            dir=bundle.parents[2],
+            delete=True,
+        )
+        for f in bundle.iterdir():
+            f.chmod(0o755)  # tar extraction does not restore mode bits
+    # The bundled loader runs directly: Google's launcher script breaks on paths with spaces
+    compiler = (
+        [system]
+        if system
+        else [str(bundle / "ld-linux-x86-64.so.2"), "--library-path", str(bundle), str(bundle / "edgetpu_compiler")]
+    )
+
+    ver = (
+        subprocess.run([*compiler, "--version"], capture_output=True, check=True).stdout.decode().rsplit(maxsplit=1)[-1]
+    )
+    LOGGER.info(f"\n{prefix} starting export with Edge TPU compiler {ver}...")
+
+    cmd = [
+        *compiler,
+        "--out_dir",
+        str(output_dir),
+        "--show_operations",
+        "--search_delegate",
+        "--delegate_search_step",
+        "30",
+        "--timeout_sec",
+        "180",
+        str(tflite_file),
+    ]  # argv list avoids shell metacharacter issues in output_dir/tflite_file paths
+    LOGGER.info(f"{prefix} running '{shlex.join(cmd)}'")
+    subprocess.run(cmd, check=True)
+    return str(Path(output_dir) / f"{Path(tflite_file).stem}_edgetpu.tflite")
+
+
+def gd_outputs(gd):
+    """Return TensorFlow GraphDef model output node names."""
+    name_list, input_list = [], []
+    for node in gd.node:  # tensorflow.core.framework.node_def_pb2.NodeDef
+        name_list.append(node.name)
+        input_list.extend(node.input)
+    return sorted(f"{x}:0" for x in list(set(name_list) - set(input_list)) if not x.startswith("NoOp"))
