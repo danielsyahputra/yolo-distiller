@@ -21,6 +21,16 @@ ROOT = Path(__file__).resolve().parent
 TARBALL_URL = "https://codeload.github.com/ultralytics/ultralytics/tar.gz/refs/heads/main"
 
 KD_CLASSES_CODE = '''
+import torch.nn.functional as F
+from ultralytics.utils.torch_utils import de_parallel
+
+try:
+    from ultralytics.utils.torch_utils import autocast
+except ImportError:
+    def autocast(enabled: bool):
+        return torch.amp.autocast("cuda", enabled=bool(enabled))
+
+
 class CWDLoss(nn.Module):
     """PyTorch version of `Channel-wise Distillation for Semantic Segmentation` (https://arxiv.org/abs/2011.13256)."""
 
@@ -263,6 +273,34 @@ class DistillationLoss:
 '''
 
 
+def _indent_block(block: str, indent: str) -> str:
+    """Indents every non-empty line of a multi-line string by `indent`."""
+    lines = block.strip("\n").splitlines()
+    return "\n".join((indent + line if line.strip() else "") for line in lines)
+
+
+def _inject_before(content: str, line_regex: str, snippet: str, count: int = 1) -> str:
+    """Finds a line matching `^([ \\t]*)(line_regex)` and injects `snippet` (indented to match) before it."""
+    pattern = re.compile(rf"(?m)^([ \t]*)({line_regex})")
+
+    def repl(m: re.Match) -> str:
+        indent, target = m.group(1), m.group(2)
+        return f"{_indent_block(snippet, indent)}\n{indent}{target}"
+
+    return pattern.sub(repl, content, count=count)
+
+
+def _inject_after(content: str, line_regex: str, snippet: str, count: int = 1) -> str:
+    """Finds a line matching `^([ \\t]*)(line_regex)` and injects `snippet` (indented to match) after it."""
+    pattern = re.compile(rf"(?m)^([ \t]*)({line_regex})")
+
+    def repl(m: re.Match) -> str:
+        indent, target = m.group(1), m.group(2)
+        return f"{indent}{target}\n{_indent_block(snippet, indent)}"
+
+    return pattern.sub(repl, content, count=count)
+
+
 def patch_default_yaml(yaml_path: Path) -> None:
     content = yaml_path.read_text(encoding="utf-8")
     if "distillation_loss:" not in content:
@@ -275,121 +313,129 @@ def patch_trainer_py(trainer_path: Path) -> None:
     if "class DistillationLoss" in content:
         return
 
-    # 1. Ensure torch.nn.functional as F and de_parallel are imported
-    if "import torch.nn.functional as F" not in content:
-        content = content.replace("import torch\n", "import torch\nimport torch.nn.functional as F\n", 1)
-    if "de_parallel" not in content:
-        content = content.replace(
-            "from ultralytics.utils.torch_utils import (",
-            "from ultralytics.utils.torch_utils import (\n    de_parallel,",
-            1,
+    # 1. Insert KD classes (and required imports) right before BaseTrainer
+    content = re.sub(
+        r"(?m)^class BaseTrainer\b",
+        KD_CLASSES_CODE.strip() + "\n\n\nclass BaseTrainer",
+        content,
+        count=1,
+    )
+
+    # 2. Extract teacher and distillation_loss in BaseTrainer.__init__ before get_cfg
+    content = _inject_before(
+        content,
+        r"self\.args = get_cfg\(cfg, overrides\)",
+        """\
+if overrides:
+    self.teacher = overrides.pop("teacher", None)
+    self.loss_type = overrides.pop("distillation_loss", None) or "cwd"
+else:
+    self.teacher = None
+    self.loss_type = None
+if self.teacher in (None, "None", "null"):
+    self.teacher = None
+if self.loss_type in (None, "None", "null"):
+    self.loss_type = "cwd"
+self.distillation_loss = None""",
+        count=1,
+    )
+
+    # 3. Initialize and freeze teacher in _setup_train
+    content = _inject_after(
+        content,
+        r"self\.model = self\.model\.to\(self\.device\)",
+        """\
+if getattr(self, "teacher", None) is not None:
+    if isinstance(self.teacher, (str, Path)):
+        self.teacher, _ = attempt_load_one_weight(str(self.teacher))
+    elif hasattr(self.teacher, "model") and isinstance(self.teacher.model, nn.Module) and not hasattr(self.teacher, "criterion"):
+        self.teacher = self.teacher.model
+    self.teacher = self.teacher.to(self.device).float().eval()
+    for _, v in self.teacher.named_parameters():
+        v.requires_grad = False
+    self.distillation_loss = DistillationLoss(
+        self.model, self.teacher, distiller=self.loss_type, device=self.device
+    )""",
+        count=1,
+    )
+
+    # 4. Register trainable KD adapter parameters in optimizer inside _setup_train
+    content = _inject_before(
+        content,
+        r"self\._setup_scheduler\(\)",
+        """\
+if getattr(self, "distillation_loss", None) is not None:
+    kd_params = [p for p in self.distillation_loss.distill_loss_fn.parameters() if p.requires_grad]
+    if kd_params:
+        base_pg = self.optimizer.param_groups[0]
+        pg = {"params": kd_params, "lr": base_pg.get("lr", self.args.lr0), "weight_decay": 0.0}
+        for k in ("use_muon", "momentum", "betas"):
+            if k in base_pg:
+                pg[k] = False if k == "use_muon" else base_pg[k]
+        self.optimizer.add_param_group(pg)""",
+        count=1,
+    )
+
+    # 5. Hook registration at start of each epoch in _do_train
+    content = _inject_after(
+        content,
+        r"self\.tloss = None\b.*",
+        """\
+if getattr(self, "teacher", None) is not None:
+    if getattr(self, "distillation_loss", None) is None:
+        self.distillation_loss = DistillationLoss(
+            self.model, self.teacher, distiller=self.loss_type, device=self.device
         )
-
-    # 2. Insert KD classes before BaseTrainer
-    content = content.replace("class BaseTrainer:", KD_CLASSES_CODE.strip() + "\n\n\nclass BaseTrainer:", 1)
-
-    # 3. Extract teacher and distillation_loss in BaseTrainer.__init__ before get_cfg
-    content = content.replace(
-        "        self.args = get_cfg(cfg, overrides)",
-        "        if overrides:\n"
-        "            self.teacher = overrides.pop('teacher', None)\n"
-        "            self.loss_type = overrides.pop('distillation_loss', None) or 'cwd'\n"
-        "        else:\n"
-        "            self.teacher = None\n"
-        "            self.loss_type = None\n"
-        "        self.distillation_loss = None\n"
-        "        self.args = get_cfg(cfg, overrides)",
-        1,
+    self.distillation_loss.register_hook()""",
+        count=1,
     )
 
-    # 4. Initialize and freeze teacher in _setup_train
-    content = content.replace(
-        "        self.model = self.model.to(self.device)",
-        "        self.model = self.model.to(self.device)\n"
-        "        if self.teacher is not None:\n"
-        "            if isinstance(self.teacher, (str, Path)):\n"
-        "                self.teacher, _ = attempt_load_one_weight(str(self.teacher))\n"
-        "            elif hasattr(self.teacher, 'model') and isinstance(self.teacher.model, nn.Module) and not hasattr(self.teacher, 'criterion'):\n"
-        "                self.teacher = self.teacher.model\n"
-        "            self.teacher = self.teacher.to(self.device).float().eval()\n"
-        "            for _, v in self.teacher.named_parameters():\n"
-        "                v.requires_grad = False\n"
-        "            self.distillation_loss = DistillationLoss(\n"
-        "                self.model, self.teacher, distiller=self.loss_type, device=self.device\n"
-        "            )",
-        1,
+    # 6. Inject teacher forward and distillation loss inside batch loop before backward
+    content = _inject_before(
+        content,
+        r"self\.scaler\.scale\(self\.loss\)\.backward\(\)",
+        """\
+if getattr(self, "teacher", None) is not None:
+    distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+    with autocast(self.amp):
+        with torch.no_grad():
+            _ = self.teacher(batch["img"])
+        self.d_loss = self.distillation_loss.get_loss() * distill_weight
+        if RANK != -1:
+            self.d_loss *= world_size
+        self.loss = self.loss + self.d_loss""",
+        count=1,
     )
 
-    # 5. Register trainable KD adapter parameters in optimizer inside _setup_train
-    content = content.replace(
-        "        self._setup_scheduler()",
-        "        if self.distillation_loss is not None:\n"
-        "            kd_params = [p for p in self.distillation_loss.distill_loss_fn.parameters() if p.requires_grad]\n"
-        "            if kd_params:\n"
-        "                base_pg = self.optimizer.param_groups[0]\n"
-        "                pg = {'params': kd_params, 'lr': base_pg.get('lr', self.args.lr0), 'weight_decay': 0.0}\n"
-        "                for k in ('use_muon', 'momentum', 'betas'):\n"
-        "                    if k in base_pg:\n"
-        "                        pg[k] = False if k == 'use_muon' else base_pg[k]\n"
-        "                self.optimizer.add_param_group(pg)\n"
-        "        self._setup_scheduler()",
-        1,
+    # 7. Remove hooks at end of epoch and at teardown
+    content = _inject_before(
+        content,
+        r"self\.lr = \{.*",
+        """\
+if getattr(self, "teacher", None) is not None and getattr(self, "distillation_loss", None) is not None:
+    self.distillation_loss.remove_handle_()""",
+        count=1,
+    )
+    content = _inject_before(
+        content,
+        r'self\.run_callbacks\(["\']teardown["\']\)',
+        """\
+if getattr(self, "teacher", None) is not None and getattr(self, "distillation_loss", None) is not None:
+    self.distillation_loss.remove_handle_()""",
+        count=0,
     )
 
-    # 6. Hook registration & loss calculation in _do_train
-    content = content.replace(
-        "            self.tloss = None\n",
-        "            self.tloss = None\n"
-        "            if self.teacher is not None:\n"
-        "                if self.distillation_loss is None:\n"
-        "                    self.distillation_loss = DistillationLoss(\n"
-        "                        self.model, self.teacher, distiller=self.loss_type, device=self.device\n"
-        "                    )\n"
-        "                self.distillation_loss.register_hook()\n",
-        1,
-    )
-
-    # 7. Inject teacher forward and distillation loss inside batch loop before backward
-    backward_target = "                # Backward\n                self.scaler.scale(self.loss).backward()"
-    kd_forward_snippet = (
-        "                if self.teacher is not None:\n"
-        "                    distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1\n"
-        "                    with autocast(self.amp):\n"
-        "                        with torch.no_grad():\n"
-        "                            _ = self.teacher(batch['img'])\n"
-        "                        self.d_loss = self.distillation_loss.get_loss() * distill_weight\n"
-        "                        if RANK != -1:\n"
-        "                            self.d_loss *= world_size\n"
-        "                        self.loss = self.loss + self.d_loss\n\n"
-        + backward_target
-    )
-    content = content.replace(backward_target, kd_forward_snippet, 1)
-
-    # 8. Remove hooks at end of epoch and end of training
-    content = content.replace(
-        "            self.lr = {f\"lr/pg{ir}\": x[\"lr\"] for ir, x in enumerate(self.optimizer.param_groups)}",
-        "            if self.teacher is not None and self.distillation_loss is not None:\n"
-        "                self.distillation_loss.remove_handle_()\n"
-        "            self.lr = {f\"lr/pg{ir}\": x[\"lr\"] for ir, x in enumerate(self.optimizer.param_groups)}",
-        1,
-    )
-    content = content.replace(
-        "        self.run_callbacks(\"teardown\")",
-        "        if self.teacher is not None and self.distillation_loss is not None:\n"
-        "            self.distillation_loss.remove_handle_()\n"
-        "        self.run_callbacks(\"teardown\")",
-        1,
-    )
-
+    # Verify syntax before writing
+    compile(content, str(trainer_path), "exec")
     trainer_path.write_text(content, encoding="utf-8")
 
 
 def sync_ultralytics(force: bool = False) -> bool:
     """Downloads latest official Ultralytics if not yet synced from upstream (or force=True) and applies KD patches."""
     init_py = ROOT / "ultralytics" / "__init__.py"
-    sync_marker = ROOT / "ultralytics" / ".synced_v26"
+    sync_marker = ROOT / "ultralytics" / ".synced_v26_r2"
     has_upstream_v26 = sync_marker.exists() or (
-        init_py.exists() and "# UPSTREAM_SYNCED_V26" in init_py.read_text(encoding="utf-8")
+        init_py.exists() and "# UPSTREAM_SYNCED_V26_R2" in init_py.read_text(encoding="utf-8")
     )
 
     if not has_upstream_v26 or force:
@@ -411,9 +457,9 @@ def sync_ultralytics(force: bool = False) -> bool:
                             shutil.copytree(src_ultralytics, ROOT / "ultralytics")
                             init_text = (ROOT / "ultralytics" / "__init__.py").read_text(encoding="utf-8")
                             (ROOT / "ultralytics" / "__init__.py").write_text(
-                                init_text + "\n# UPSTREAM_SYNCED_V26\n", encoding="utf-8"
+                                init_text + "\n# UPSTREAM_SYNCED_V26_R2\n", encoding="utf-8"
                             )
-                            (ROOT / "ultralytics" / ".synced_v26").write_text("synced\n", encoding="utf-8")
+                            (ROOT / "ultralytics" / ".synced_v26_r2").write_text("synced\n", encoding="utf-8")
                         src_pyproject = src_root / "pyproject.toml"
                         if src_pyproject.exists():
                             shutil.copy2(src_pyproject, ROOT / "pyproject.toml")

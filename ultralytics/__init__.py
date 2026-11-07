@@ -6,7 +6,7 @@ import os
 from pathlib import Path as _Path
 
 # Auto-sync latest official Ultralytics (YOLO26 / Segment26 / Proto26) + KD patches on first run when online
-_sync_marker = _Path(__file__).resolve().parent / ".synced_v26"
+_sync_marker = _Path(__file__).resolve().parent / ".synced_v26_r2"
 _sync_script = _Path(__file__).resolve().parent.parent / "sync_upstream.py"
 if not _sync_marker.exists() and _sync_script.exists():
     try:

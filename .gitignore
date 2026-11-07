@@ -27,7 +27,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 ultralytics.egg-info
-.synced_v26
+.synced_v26*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
