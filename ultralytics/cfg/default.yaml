@@ -139,5 +139,5 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 tracker: tracktrack.yaml # (str) tracker config: botsort.yaml, bytetrack.yaml, ocsort.yaml, deepocsort.yaml, fasttrack.yaml, tracktrack.yaml
 
 # Knowledge Distillation settings
-teacher: None
-distillation_loss: None
+teacher: # (str | nn.Module, optional) teacher model or checkpoint path for knowledge distillation
+distillation_loss: cwd # (str) knowledge distillation loss method: 'cwd', 'mgd', or 'sl2'

@@ -27,7 +27,7 @@ from torch import nn, optim
 from ultralytics import __version__
 from ultralytics.cfg import _YOLO_CLI_COMMAND, get_cfg, get_save_dir
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset, convert_ndjson_to_yolo_if_needed
-from ultralytics.nn.distill_model import DistillationModel
+from ultralytics.nn.distill_model import CWDLoss, DistillationModel, MGDAdapter, MGDLoss
 from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.optim import MuSGD
 from ultralytics.utils import (
@@ -75,259 +75,6 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
-
-
-import torch.nn.functional as F
-
-if "autocast" not in globals():
-    def autocast(enabled: bool):
-        return torch.amp.autocast("cuda", enabled=bool(enabled))
-
-
-def _unwrap_model(m: nn.Module) -> nn.Module:
-    """Unwrap DataParallel or DistributedDataParallel model to its base nn.Module."""
-    return m.module if hasattr(m, "module") else m
-
-
-class CWDLoss(nn.Module):
-    """PyTorch version of `Channel-wise Distillation for Semantic Segmentation` (https://arxiv.org/abs/2011.13256)."""
-
-    def __init__(self, channels_s, channels_t, tau=1.0):
-        super().__init__()
-        self.tau = tau
-
-    def forward(self, y_s, y_t):
-        assert len(y_s) == len(y_t)
-        losses = []
-        for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            assert s.shape == t.shape, f"Shape mismatch at stage {idx}: student {s.shape} vs teacher {t.shape}"
-            N, C, H, W = s.shape
-            s_fp32 = s.float().reshape(-1, W * H) / self.tau
-            t_fp32 = t.float().reshape(-1, W * H) / self.tau
-            softmax_pred_T = F.softmax(t_fp32, dim=1)
-            logsoftmax = torch.nn.LogSoftmax(dim=1)
-            cost = torch.sum(
-                softmax_pred_T * logsoftmax(t_fp32) - softmax_pred_T * logsoftmax(s_fp32)
-            ) * (self.tau ** 2)
-            losses.append(cost / (C * N))
-        return sum(losses)
-
-
-class MGDLoss(nn.Module):
-    """PyTorch version of `Masked Generative Distillation` (https://arxiv.org/abs/2205.01529)."""
-
-    def __init__(self, student_channels, teacher_channels, alpha_mgd=0.00002, lambda_mgd=0.65, device=None):
-        super().__init__()
-        self.alpha_mgd = alpha_mgd
-        self.lambda_mgd = lambda_mgd
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.generation = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(channel, channel, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(channel, channel, kernel_size=3, padding=1),
-            ).to(device)
-            for channel in teacher_channels
-        ])
-
-    def forward(self, y_s, y_t, layer=None):
-        losses = []
-        for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            if layer == "outlayer":
-                idx = -1
-            losses.append(self.get_dis_loss(s, t, idx) * self.alpha_mgd)
-        return sum(losses)
-
-    def get_dis_loss(self, preds_S, preds_T, idx):
-        loss_mse = nn.MSELoss(reduction="sum")
-        N, C, H, W = preds_T.shape
-        device = preds_S.device
-        mat = torch.rand((N, 1, H, W), device=device)
-        mat = torch.where(mat > 1 - self.lambda_mgd, 0, 1).to(dtype=preds_S.dtype, device=device)
-        masked_fea = torch.mul(preds_S, mat)
-        new_fea = self.generation[idx](masked_fea)
-        return loss_mse(new_fea.float().contiguous(), preds_T.float().contiguous()) / N
-
-
-class FeatureLoss(nn.Module):
-    """Feature alignment and distillation loss wrapper supporting cross-scale student/teacher pairs."""
-
-    def __init__(self, channels_s, channels_t, distiller="cwd", loss_weight=1.0, device=None):
-        super().__init__()
-        self.loss_weight = loss_weight
-        self.distiller = (distiller or "cwd").lower()[:3]
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        self.align_module = nn.ModuleList()
-        self.norm = nn.ModuleList()
-        self.norm1 = nn.ModuleList()
-
-        for s_chan, t_chan in zip(channels_s, channels_t):
-            self.align_module.append(
-                nn.Sequential(
-                    nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
-                    nn.BatchNorm2d(t_chan, affine=False),
-                ).to(device)
-            )
-        for t_chan in channels_t:
-            self.norm.append(nn.BatchNorm2d(t_chan, affine=False).to(device))
-        for s_chan in channels_s:
-            self.norm1.append(nn.BatchNorm2d(s_chan, affine=False).to(device))
-
-        if self.distiller == "mgd":
-            self.feature_loss = MGDLoss(channels_s, channels_t, device=device)
-        elif self.distiller == "cwd":
-            self.feature_loss = CWDLoss(channels_s, channels_t)
-        else:
-            raise NotImplementedError(f"Unsupported distillation_loss='{distiller}'. Expected 'cwd' or 'mgd'.")
-
-    def forward(self, y_s, y_t):
-        if len(y_s) != len(y_t):
-            y_t = y_t[len(y_t) // 2:]
-        tea_feats, stu_feats = [], []
-        for idx, (s, t) in enumerate(zip(y_s, y_t)):
-            param_dtype = next(self.align_module[idx].parameters()).dtype
-            s = self.align_module[idx](s.to(dtype=param_dtype))
-            t = t.detach().to(dtype=param_dtype)
-            if self.distiller != "cwd":
-                t = self.norm[idx](t)
-            stu_feats.append(s)
-            tea_feats.append(t)
-        return self.loss_weight * self.feature_loss(stu_feats, tea_feats)
-
-
-class DistillationLoss:
-    """Multi-scale forward-hook manager for YOLO26, YOLO12, YOLO11, YOLOv10, YOLOv9, YOLOv8."""
-
-    def __init__(self, models, modelt, distiller="cwd", device=None):
-        self.distiller = (distiller or "cwd").lower()[:3]
-        self.layers = ["6", "8", "13", "16", "19", "22"]
-        self.models = _unwrap_model(models)
-        self.modelt = _unwrap_model(modelt)
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.channels_s = []
-        self.channels_t = []
-        self.teacher_module_pairs = []
-        self.student_module_pairs = []
-        self.remove_handle = []
-        self.teacher_outputs = []
-        self.student_outputs = []
-
-        self._find_layers()
-        self.distill_loss_fn = FeatureLoss(
-            channels_s=self.channels_s,
-            channels_t=self.channels_t,
-            distiller=self.distiller,
-            device=self.device,
-        )
-
-    @classmethod
-    def _extract_model_layers(cls, model, default_layers):
-        base = _unwrap_model(model)
-        seq = getattr(base, "model", None)
-        if isinstance(seq, nn.Sequential) and len(seq) > 0:
-            head = seq[-1]
-            head_from = getattr(head, "f", None)
-            if isinstance(head_from, list) and all(isinstance(x, int) and x > 0 for x in head_from):
-                neck_layers = [str(x) for x in head_from]
-                if neck_layers == ["15", "18", "21"]:
-                    target_layers = ["6", "8", "12", "15", "18", "21"]
-                else:
-                    target_layers = ["6", "8", "13", *neck_layers]
-            else:
-                target_layers = list(default_layers)
-
-            found = []
-            for l_str in target_layers:
-                idx = int(l_str)
-                if idx < len(seq):
-                    block = seq[idx]
-                    sub = getattr(block, "cv2", getattr(block, "cv4", getattr(block, "cv3", block)))
-                    conv = getattr(sub, "conv", sub)
-                    out_ch = getattr(conv, "out_channels", None)
-                    if out_ch is not None:
-                        found.append((sub, out_ch))
-            if found:
-                return found
-
-        found = []
-        for name, ml in base.named_modules():
-            if name:
-                parts = name.split(".")
-                if parts[0] == "model" and len(parts) == 3 and parts[1] in default_layers and "cv2" in parts[2]:
-                    if hasattr(ml, "conv"):
-                        found.append((ml, ml.conv.out_channels))
-        return found
-
-    def _find_layers(self):
-        self.channels_s = []
-        self.channels_t = []
-        self.teacher_module_pairs = []
-        self.student_module_pairs = []
-
-        t_found = self._extract_model_layers(self.modelt, self.layers)
-        s_found = self._extract_model_layers(self.models, self.layers)
-
-        nl = min(len(s_found), len(t_found))
-        for (s_mod, s_ch), (t_mod, t_ch) in zip(s_found[-nl:], t_found[-nl:]):
-            self.student_module_pairs.append(s_mod)
-            self.channels_s.append(s_ch)
-            self.teacher_module_pairs.append(t_mod)
-            self.channels_t.append(t_ch)
-
-        LOGGER.info(
-            f"{colorstr('Knowledge Distillation:')} mode={self.distiller.upper()}, "
-            f"paired {nl} multi-scale layers (student={self.channels_s} -> teacher={self.channels_t})"
-        )
-
-    def clear_outputs(self):
-        self.teacher_outputs.clear()
-        self.student_outputs.clear()
-
-    def register_hook(self):
-        self.remove_handle_()
-        self.clear_outputs()
-
-        def make_student_hook(l):
-            def forward_hook(m, input, output):
-                if isinstance(output, torch.Tensor):
-                    l.append(output.clone())
-                else:
-                    l.append([o.clone() if isinstance(o, torch.Tensor) else o for o in output])
-            return forward_hook
-
-        def make_teacher_hook(l):
-            def forward_hook(m, input, output):
-                if isinstance(output, torch.Tensor):
-                    l.append(output.detach().clone())
-                else:
-                    l.append([o.detach().clone() if isinstance(o, torch.Tensor) else o for o in output])
-            return forward_hook
-
-        for ml, ori in zip(self.teacher_module_pairs, self.student_module_pairs):
-            self.remove_handle.append(ml.register_forward_hook(make_teacher_hook(self.teacher_outputs)))
-            self.remove_handle.append(ori.register_forward_hook(make_student_hook(self.student_outputs)))
-
-    def get_loss(self):
-        if not self.teacher_outputs or not self.student_outputs:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        if len(self.teacher_outputs) != len(self.student_outputs):
-            self.clear_outputs()
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-        quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
-        if self.distiller != "cwd":
-            quant_loss = quant_loss * 0.3
-        self.clear_outputs()
-        return quant_loss
-
-    def remove_handle_(self):
-        for rm in self.remove_handle:
-            rm.remove()
-        self.remove_handle.clear()
-        self.clear_outputs()
 
 
 class BaseTrainer:
@@ -392,17 +139,24 @@ class BaseTrainer:
             overrides (dict, optional): Configuration overrides.
             _callbacks (dict, optional): Dictionary of callback functions.
         """
+        self.teacher = None
         if overrides:
-            self.teacher = overrides.pop("teacher", None)
-            self.loss_type = overrides.pop("distillation_loss", None) or "cwd"
-        else:
-            self.teacher = None
-            self.loss_type = None
-        if self.teacher in (None, "None", "null"):
-            self.teacher = None
-        if self.loss_type in (None, "None", "null"):
-            self.loss_type = "cwd"
-        self.distillation_loss = None
+            teacher_arg = overrides.pop("teacher", None)
+            if teacher_arg not in (None, "None", "null"):
+                if isinstance(teacher_arg, (str, Path)):
+                    overrides.setdefault("distill_model", str(teacher_arg))
+                else:
+                    self.teacher = teacher_arg
+                    pt_path = (
+                        getattr(teacher_arg, "pt_path", None)
+                        or getattr(teacher_arg, "ckpt_path", None)
+                        or getattr(getattr(teacher_arg, "model", None), "pt_path", None)
+                    )
+                    if pt_path and not overrides.get("distill_model"):
+                        overrides["distill_model"] = str(pt_path)
+            loss_arg = overrides.get("distillation_loss")
+            if loss_arg in (None, "None", "null"):
+                overrides["distillation_loss"] = "cwd"
         self.args = get_cfg(cfg, overrides)
         self.check_resume(overrides or {})
         if getattr(self.args, "augmentations", None) and not isinstance(self.args.augmentations[0], dict):
@@ -528,8 +282,6 @@ class BaseTrainer:
         finally:
             unset_deterministic()  # never leave deterministic state on, including the DDP parent and failed runs
             if not self.ddp:
-                if getattr(self, "teacher", None) is not None and getattr(self, "distillation_loss", None) is not None:
-                    self.distillation_loss.remove_handle_()
                 self.run_callbacks("teardown")
 
     def _setup_scheduler(self):
@@ -601,17 +353,6 @@ class BaseTrainer:
                 decay=weight_decay,
                 iterations=iterations,
             )
-            if getattr(self, "distillation_loss", None) is not None:
-                kd_params = [p for p in self.distillation_loss.distill_loss_fn.parameters() if p.requires_grad]
-                if kd_params:
-                    base_pg = self.optimizer.param_groups[0]
-                    pg = {k: v for k, v in base_pg.items() if k not in {"params", "initial_lr"}}
-                    pg["params"] = kd_params
-                    pg["weight_decay"] = 0.0
-                    pg["param_group"] = "kd"
-                    if "use_muon" in pg:
-                        pg["use_muon"] = False
-                    self.optimizer.add_param_group(pg)
             self._setup_scheduler()
         else:
             for group in self.optimizer.param_groups:
@@ -624,18 +365,6 @@ class BaseTrainer:
         if self.resume and ckpt:
             init_seeds(self.args.seed + 2 + RANK + ckpt.get("epoch", -1), deterministic=self.args.deterministic)
         self.model = self.model.to(self.device)
-        if getattr(self, "teacher", None) is not None:
-            if isinstance(self.teacher, (str, Path)):
-                from ultralytics.nn.tasks import attempt_load_one_weight
-                self.teacher, _ = attempt_load_one_weight(str(self.teacher))
-            elif hasattr(self.teacher, "model") and isinstance(self.teacher.model, nn.Module) and not hasattr(self.teacher, "criterion"):
-                self.teacher = self.teacher.model
-            self.teacher = self.teacher.to(self.device).float().eval()
-            for _, v in self.teacher.named_parameters():
-                v.requires_grad = False
-            self.distillation_loss = DistillationLoss(
-                self.model, self.teacher, distiller=self.loss_type, device=self.device
-            )
         # channels_last (NHWC) is CUDA-only: lossless and Tensor-Core friendly there, but numerically wrong
         # on MPS and no benefit on CPU. Not auto-enabled on Windows, where it measured 3x slower (#26105).
         channels_last = self.args.channels_last is True or (
@@ -682,7 +411,11 @@ class BaseTrainer:
         )
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
-        if isinstance(unwrap_model(self.model), DistillationModel):
+        if (
+            isinstance(unwrap_model(self.model), DistillationModel)
+            or self.args.distill_model is not None
+            or getattr(self, "teacher", None) is not None
+        ):
             freeze_layer_names.append("teacher_model.")
         self.freeze_layer_names = freeze_layer_names
         for k, v in self.model.named_parameters():
@@ -725,8 +458,13 @@ class BaseTrainer:
                 else torch.cuda.amp.GradScaler(enabled=self.amp and self.args.amp != "bf16")
             )
         # resume training would directly load DistillationModel so check here
-        if self.args.distill_model is not None and not isinstance(unwrap_model(self.model), DistillationModel):
-            self.model = DistillationModel(student_model=self.model, teacher_model=self.args.distill_model)
+        teacher_source = self.teacher if getattr(self, "teacher", None) is not None else self.args.distill_model
+        if teacher_source is not None and not isinstance(unwrap_model(self.model), DistillationModel):
+            self.model = DistillationModel(
+                student_model=self.model,
+                teacher_model=teacher_source,
+                loss_type=getattr(self.args, "distillation_loss", "cwd"),
+            )
         if self.world_size > 1:
             # static_graph=True permits params used >1 time per forward (e.g. flow_model in
             # o2m+o2o pose loss branches) under torch.compile.
@@ -807,16 +545,8 @@ class BaseTrainer:
                     LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
-            if getattr(self, "teacher", None) is not None:
-                if getattr(self, "distillation_loss", None) is None:
-                    self.distillation_loss = DistillationLoss(
-                        self.model, self.teacher, distiller=self.loss_type, device=self.device
-                    )
-                self.distillation_loss.register_hook()
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
-                if getattr(self, "distillation_loss", None) is not None:
-                    self.distillation_loss.clear_outputs()
                 # Warmup
                 ni = i + nb * epoch
                 if nw and ni <= nw:  # ni == nw lands accumulate, lr and momentum exactly on their targets
@@ -862,15 +592,6 @@ class BaseTrainer:
                         )
 
                     # Backward
-                    if getattr(self, "teacher", None) is not None:
-                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
-                        with autocast(torch.bfloat16 if self.args.amp == "bf16" else self.amp, device=self.device.type):
-                            with torch.no_grad():
-                                _ = self.teacher(batch["img"])
-                            self.d_loss = self.distillation_loss.get_loss() * distill_weight
-                            if RANK != -1:
-                                self.d_loss *= self.world_size
-                            self.loss = self.loss + self.d_loss
                     self.scaler.scale(self.loss).backward()
                 except RuntimeError as e:
                     is_oom = "out of memory" in str(e).lower()  # torch.cuda.OutOfMemoryError requires torch>=1.13
@@ -951,8 +672,6 @@ class BaseTrainer:
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
 
-            if getattr(self, "teacher", None) is not None and getattr(self, "distillation_loss", None) is not None:
-                self.distillation_loss.remove_handle_()
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
             self.run_callbacks("on_train_epoch_end")
@@ -1215,8 +934,13 @@ class BaseTrainer:
             student_model = self.get_model(cfg=cfg, weights=weights.student_model, verbose=RANK in {-1, 0})
             student_model.args = self.args
             # teacher is stripped from the checkpoint to save memory/disk; rebuild it from the distill_model path
-            teacher_model = weights.teacher_model if weights.teacher_model is not None else self.args.distill_model
-            model = DistillationModel(student_model=student_model, teacher_model=teacher_model)
+            teacher_model = (
+                weights.teacher_model
+                if weights.teacher_model is not None
+                else (self.teacher if getattr(self, "teacher", None) is not None else self.args.distill_model)
+            )
+            loss_type = getattr(weights, "loss_type", getattr(self.args, "distillation_loss", "cwd"))
+            model = DistillationModel(student_model=student_model, teacher_model=teacher_model, loss_type=loss_type)
             if getattr(weights, "projector", None) is not None:
                 model.projector.load_state_dict(weights.projector.state_dict())  # restore the trained projector
             model.criterion = None
@@ -1375,6 +1099,7 @@ class BaseTrainer:
                 "plots",
                 "channels_last",
                 "distill_model",
+                "distillation_loss",
                 "save_dir",
             }
             ignored = []
